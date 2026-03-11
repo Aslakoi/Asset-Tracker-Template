@@ -1,4 +1,24 @@
-# Asset Tracker Template
+# Asset Tracker Template ()
+
+**Getting started**
+
+Before initializing, start the toolchain environment:
+
+```shell
+nrfutil sdk-manager toolchain launch --ncs-version v3.x.x --shell
+```
+
+To initialize the workspace folder (`asset-tracker-template`) where the firmware project and all nRF Connect SDK modules will be cloned, run the following commands:
+
+```shell
+# Initialize asset-tracker-template workspace
+west init -m https://github.com/IES2609/att.git --mr main asset-tracker-template
+
+cd asset-tracker-template
+
+# Update nRF Connect SDK modules. This may take a while.
+west update
+```
 
 **Oncommit**
 

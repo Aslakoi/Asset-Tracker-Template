@@ -35,6 +35,34 @@ config APP_ENVIRONMENTAL_MSG_PROCESSING_TIMEOUT_SECONDS
 	  Maximum time allowed for processing a single message in the module's state machine.
 	  The value must be smaller than CONFIG_APP_ENVIRONMENTAL_WATCHDOG_TIMEOUT_SECONDS.
 
+config APP_ENVIRONMENTAL_IMU_SAMPLING_FREQUENCY_HZ
+	int "IMU sampling frequency (Hz)"
+	default 50
+	range 1 200
+	help
+	  Sampling frequency for the BMI270 (accelerometer/gyroscope) and ADXL367
+	  (low-power accelerometer) sensors in Hz. The sampling period in milliseconds
+	  is calculated as 1000/frequency.
+	  
+	  Supported values:
+	  - 50 Hz (20 ms): Default, good balance between data rate and power consumption
+	  - Other values: Depends on sensor configuration
+
+config APP_ENVIRONMENTAL_RING_BUFFER_SIZE
+	int "IMU ring buffer size (bytes)"
+	default 2048
+	range 512 4096
+	help
+	  Size of the ring buffer used to store sensor samples from BMI270 and ADXL367.
+	  This uses Zephyr's sys/ring_buffer.h (not K_FIFO).
+	  Each sample is approximately 64 bytes, so:
+	  - 512 bytes: ~8 samples
+	  - 1024 bytes: ~16 samples
+	  - 2048 bytes: ~32 samples (default, recommended)
+	  - 4096 bytes: ~64 samples
+	  
+	  Larger buffers reduce sample loss at the cost of more memory usage.
+
 module = APP_ENVIRONMENTAL
 module-str = ENVIRONMENTAL
 source "subsys/logging/Kconfig.template.log_config"
