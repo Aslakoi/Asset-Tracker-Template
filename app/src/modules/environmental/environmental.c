@@ -17,13 +17,14 @@
 #include "environmental.h"
 
 #define FS 50 /* Sampling frequency in Hz */
-#define FS_MS 20 /* Sampling frequency in milliseconds (1000/50) */
+#define FS_MS 1000 / FS /* Sampling frequency in milliseconds (1000/1) */
+
 #define ENV_FS 1 /* Environmental sensor (BME680) sampling frequency in Hz */
-#define ENV_FS_MS 1000 /* Environmental sensor sampling frequency in milliseconds */
+#define ENV_FS_MS 1000 / ENV_FS /* Environmental sensor sampling frequency in milliseconds */
 #define ENV_SAMPLES_BETWEEN_PUBLISH 50 /* Include environmental data in every Nth IMU message */
 
 /* Ring buffer for sensor samples */
-#define SAMPLE_BUFFER_SIZE 4096
+#define SAMPLE_BUFFER_SIZE 2048
 #define SAMPLES_PER_BATCH 10  /* Publish every x samples to batch and reduce zbus load */
 static uint8_t sample_buffer[SAMPLE_BUFFER_SIZE];
 static struct ring_buf sample_ring_buf;
@@ -97,7 +98,7 @@ struct environmental_state_object {
 	float accel_lp[3];
 };
 
-/* Sample data structure for storing in FIFO */
+/* Sample data structure for storing */
 struct sensor_sample {
 	float accel_hp[3];
 	float gyro_hp[3];
@@ -157,7 +158,7 @@ static void sample_publish_work_handler(struct k_work *work)
 			msg.pressure = latest_pressure;
 			msg.humidity = latest_humidity;
 			imu_sample_count = 0;
-			LOG_DBG("Publishing sensor sample with ENV: accel_hp[%.2f, %.2f, %.2f] g, "
+			LOG_INF("Publishing sensor sample with ENV: accel_hp[%.2f, %.2f, %.2f] g, "
 				"gyro_hp[%.2f, %.2f, %.2f] dps, accel_lp[%.2f, %.2f, %.2f] g, "
 				"temp=%.2f C, press=%.2f Pa, humidity=%.2f %%",
 				(double)msg.accel_hp[0], (double)msg.accel_hp[1], (double)msg.accel_hp[2],
@@ -165,7 +166,7 @@ static void sample_publish_work_handler(struct k_work *work)
 				(double)msg.accel_lp[0], (double)msg.accel_lp[1], (double)msg.accel_lp[2],
 				(double)msg.temperature, (double)msg.pressure, (double)msg.humidity);
 		} else {
-			LOG_DBG("Publishing sensor sample: accel_hp[%.2f, %.2f, %.2f] g, "
+			LOG_INF("Publishing sensor sample: accel_hp[%.2f, %.2f, %.2f] g, "
 				"gyro_hp[%.2f, %.2f, %.2f] dps, accel_lp[%.2f, %.2f, %.2f] g",
 				(double)msg.accel_hp[0], (double)msg.accel_hp[1], (double)msg.accel_hp[2],
 				(double)msg.gyro_hp[0], (double)msg.gyro_hp[1], (double)msg.gyro_hp[2],
