@@ -136,6 +136,11 @@ static void state_buffer_pipe_active_entry(void *o);
 static enum smf_state_result state_buffer_pipe_active_run(void *o);
 static void state_buffer_pipe_active_exit(void *o);
 
+/*Tracking number of bytes written to flash*/
+static size_t bytes_written = 0;
+bool storage_full = false;
+static size_t max_bytes = 0x1880000; //Roughly 10% margin (LittleFS has overhead)
+
 /* Storage pipe for streaming data to consumers */
 K_PIPE_DEFINE(storage_pipe, CONFIG_APP_STORAGE_BATCH_BUFFER_SIZE, 4);
 
@@ -347,10 +352,21 @@ static void handle_data_message(const struct storage_state *state_object,
 
 	type->extract_data(buf, (void *)data);
 
+	LOG_INF("Data size: %lu", type->data_size);
+	LOG_INF("Bytes written: %lu", bytes_written);
+
+	if (bytes_written + type->data_size > max_bytes) {
+		LOG_WRN("Flash full limit reached, stopping program");
+		storage_full = true; 
+		return;
+	}
+
 	err = backend->store(type, (const void *)data, type->data_size);
 	if (err) {
 		LOG_ERR("Failed to store %s data, error: %d", type->name, err);
 	}
+
+	bytes_written += type->data_size;
 
 	check_and_notify_buffer_threshold(state_object, type);
 }
