@@ -1677,6 +1677,11 @@ int main(void)
 	smf_set_initial(SMF_CTX(&main_state), &states[STATE_RUNNING]);
 
 	while (1) {
+		if (storage_full){
+			LOG_WRN("Storage full");
+			return -1;
+		}
+
 		err = task_wdt_feed(task_wdt_id);
 		if (err) {
 			LOG_ERR("task_wdt_feed, error: %d", err);
