@@ -16,12 +16,12 @@
 #include "app_common.h"
 #include "environmental.h"
 
-#define FS 50 /* Sampling frequency in Hz */
-#define FS_MS 20 /* Sampling frequency in milliseconds (1000/50) */
+#define FS 20 /* Sampling frequency in Hz */
+#define FS_MS 1000 / FS /* Sampling frequency in milliseconds (1000/50) */
 
 /* Ring buffer for sensor samples */
-#define SAMPLE_BUFFER_SIZE 4096
-#define SAMPLES_PER_BATCH 10  /* Publish every x samples to batch and reduce zbus load */
+#define SAMPLE_BUFFER_SIZE 2048
+#define SAMPLES_PER_BATCH 5  /* Publish every x samples to batch and reduce zbus load */
 static uint8_t sample_buffer[SAMPLE_BUFFER_SIZE];
 static struct ring_buf sample_ring_buf;
 static uint8_t sample_count = 0;  /* Counter for batching */
