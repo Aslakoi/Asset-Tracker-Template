@@ -22,6 +22,11 @@
 	current-speed = <1000000>;
 };
 
+&uart0 {
+	status = "okay";
+	current-speed = <1000000>;
+};
+
 /* Switch to nrf7000 emulation so that scan-only mode is used. */
 &nrf70 {
 	compatible = "nordic,nrf7000-spi";
@@ -58,3 +63,14 @@
 		};
 	};
 };
+
+&accelerometer_hp {
+	status = "okay";
+	irq-gpios = <&gpio0 06 GPIO_ACTIVE_LOW>;
+};
+
+&accelerometer_lp {
+	status = "okay";
+	int1-gpios = <&gpio0 11 GPIO_ACTIVE_HIGH>; //INT4
+};
+
