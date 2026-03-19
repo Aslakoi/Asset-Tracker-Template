@@ -16,26 +16,22 @@
 #include "app_common.h"
 #include "environmental.h"
 
-#define FS 50 /* Sampling frequency in Hz */
+#define FS 25 /* Sampling frequency in Hz */
 #define FS_MS 1000 / FS /* Sampling frequency in milliseconds (1000/1) */
 
 #define ENV_FS 1 /* Environmental sensor (BME680) sampling frequency in Hz */
 #define ENV_FS_MS 1000 / ENV_FS /* Environmental sensor sampling frequency in milliseconds */
 #define ENV_SAMPLES_BETWEEN_PUBLISH 50 /* Include environmental data in every Nth IMU message */
 
-/* Ring buffer for sensor samples */
-#define SAMPLE_BUFFER_SIZE 2048
-#define SAMPLES_PER_BATCH 10  /* Publish every x samples to batch and reduce zbus load */
-
-static uint8_t sample_buffer[SAMPLE_BUFFER_SIZE];
-static struct ring_buf sample_ring_buf;
-static uint8_t sample_count = 0;  /* Counter for batching */
-static uint8_t imu_sample_count = 0;  /* Counter for IMU samples to include env data periodically */
+/* Batch message accumulation */
+static struct environmental_msg batch_msg = {
+	.type = ENVIRONMENTAL_SENSOR_SAMPLE_RESPONSE,
+	.sample_count = 0,
+};
+static uint8_t imu_sample_count = 0;  /* Counter for IMU samples to include pressure periodically */
 
 /* Latest environmental sensor readings (updated at 1 Hz) */
-static float latest_temperature = 0.0f;
 static float latest_pressure = 0.0f;
-static float latest_humidity = 0.0f;
 LOG_MODULE_REGISTER(environmental, CONFIG_APP_ENVIRONMENTAL_LOG_LEVEL);
 
 /* Define channels provided by this module */
@@ -84,28 +80,17 @@ struct environmental_state_object {
 	/* Pointer to the BME680 sensor device */
 	const struct device *const bme680;
 
-	/* Sensor values */
-	int16_t temperature;
-	int16_t pressure;
-	int16_t humidity;
-
 	const struct device *const bmi270;
 
-	float accel_hp[3];
-	float gyro_hp[3];
+	float accel_hp[3][SAMPLES_PER_BATCH];
+	float gyro_hp[3][SAMPLES_PER_BATCH];
 
 	const struct device *const adxl367;
 
-	float accel_lp[3];
+	float accel_lp[3][SAMPLES_PER_BATCH];
 };
 
-/* Sample data structure for storing */
-struct sensor_sample {
-	float accel_hp[3];
-	float gyro_hp[3];
-	float accel_lp[3];
-	int64_t timestamp;
-};
+
 
 /* Global sensor device pointers for work handlers */
 static const struct device *g_bmi270;
@@ -119,7 +104,7 @@ static void sample_collect_work_handler(struct k_work *work);
 static void env_sample_work_handler(struct k_work *work);
 
 /* Work items for sensor sampling */
-static K_WORK_DEFINE(sample_publish_work, sample_publish_work_handler);
+static K_WORK_DELAYABLE_DEFINE(sample_publish_work, sample_publish_work_handler);
 static K_WORK_DELAYABLE_DEFINE(sample_collect_work, sample_collect_work_handler);
 static K_WORK_DELAYABLE_DEFINE(env_sample_work, env_sample_work_handler);
 
@@ -128,75 +113,54 @@ static const struct smf_state states[] = {
 	[STATE_RUNNING] = SMF_CREATE_STATE(NULL, state_running_run, NULL, NULL, NULL),
 };
 
-/* Process samples from ring buffer and publish them to zbus */
+/* Publish accumulated batch message to zbus */
 static void sample_publish_work_handler(struct k_work *work)
 {
 	int err;
-	struct sensor_sample sample;
-	int published_count = 0;
 
 	ARG_UNUSED(work);
 
-	/* Process all available samples in ring buffer and publish them */
-	while (ring_buf_get(&sample_ring_buf, (uint8_t *)&sample, sizeof(sample)) == sizeof(sample)) {
-		struct environmental_msg msg = {
-			.type = ENVIRONMENTAL_SENSOR_SAMPLE_RESPONSE,
-			.accel_hp[0] = sample.accel_hp[0],
-			.accel_hp[1] = sample.accel_hp[1],
-			.accel_hp[2] = sample.accel_hp[2],
-			.gyro_hp[0] = sample.gyro_hp[0],
-			.gyro_hp[1] = sample.gyro_hp[1],
-			.gyro_hp[2] = sample.gyro_hp[2],
-			.accel_lp[0] = sample.accel_lp[0],
-			.accel_lp[1] = sample.accel_lp[1],
-			.accel_lp[2] = sample.accel_lp[2],
-			.timestamp = sample.timestamp,
-		};
+	if (batch_msg.sample_count == 0) {
+		LOG_WRN("sample_publish_work_handler: batch_msg.sample_count is 0");
+		return;
+	}
 
-		/* Include environmental data every ENV_SAMPLES_BETWEEN_PUBLISH samples */
-		imu_sample_count++;
-		if (imu_sample_count >= ENV_SAMPLES_BETWEEN_PUBLISH) {
-			msg.temperature = latest_temperature;
-			msg.pressure = latest_pressure;
-			msg.humidity = latest_humidity;
-			imu_sample_count = 0;
-			LOG_DBG("Publishing sensor sample with ENV: accel_hp[%.2f, %.2f, %.2f] g, "
-				"gyro_hp[%.2f, %.2f, %.2f] dps, accel_lp[%.2f, %.2f, %.2f] g, "
-				"temp=%.2f C, press=%.2f Pa, humidity=%.2f %%",
-				(double)msg.accel_hp[0], (double)msg.accel_hp[1], (double)msg.accel_hp[2],
-				(double)msg.gyro_hp[0], (double)msg.gyro_hp[1], (double)msg.gyro_hp[2],
-				(double)msg.accel_lp[0], (double)msg.accel_lp[1], (double)msg.accel_lp[2],
-				(double)msg.temperature, (double)msg.pressure, (double)msg.humidity);
+	LOG_INF("Publishing batch with %d samples",
+		batch_msg.sample_count);
+
+	err = zbus_chan_pub(&environmental_chan, &batch_msg, PUB_TIMEOUT);
+	if (err) {
+		if (err == -ENOMEM || err == -EAGAIN) {
+			/* Temporary resource exhaustion (net_buf pool full) - retry later */
+			LOG_WRN("zbus_chan_pub batch failed with %d (resource issue), retrying in 10ms", err);
+			k_work_reschedule(&sample_publish_work, K_MSEC(10));
+			return;
 		} else {
-			LOG_DBG("Publishing sensor sample: accel_hp[%.2f, %.2f, %.2f] g, "
-				"gyro_hp[%.2f, %.2f, %.2f] dps, accel_lp[%.2f, %.2f, %.2f] g",
-				(double)msg.accel_hp[0], (double)msg.accel_hp[1], (double)msg.accel_hp[2],
-				(double)msg.gyro_hp[0], (double)msg.gyro_hp[1], (double)msg.gyro_hp[2],
-				(double)msg.accel_lp[0], (double)msg.accel_lp[1], (double)msg.accel_lp[2]);
-		}
-
-		err = zbus_chan_pub(&environmental_chan, &msg, PUB_TIMEOUT);
-		if (err) {
-			LOG_ERR("zbus_chan_pub, error: %d", err);
+			LOG_ERR("zbus_chan_pub batch, error: %d", err);
 			SEND_FATAL_ERROR();
 			return;
 		}
-
-		published_count++;
 	}
 
-	if (published_count > 0) {
-		LOG_INF("Published %d samples in batch", published_count);
-	}
+	/* Reset batch message for next batch */
+	batch_msg.sample_count = 0;
 }
 
-/* Periodic work handler to sample sensors at 50 Hz */
+/* Periodic work handler to sample sensors at 50 Hz and accumulate into batch message */
 static void sample_collect_work_handler(struct k_work *work)
 {
 	int err;
-	struct sensor_sample sample = { 0 };
+	uint8_t idx;  /* Index into batch arrays */
 
 	ARG_UNUSED(work);
+
+	/* If batch is full, don't collect more samples until it's published */
+	if (batch_msg.sample_count >= SAMPLES_PER_BATCH) {
+		LOG_WRN("Batch buffer full, skipping sample");
+		return;
+	}
+
+	idx = batch_msg.sample_count;
 
 	/* Fetch data from BMI270 (accelerometer and gyroscope - high performance) */
 	if (g_bmi270 && device_is_ready(g_bmi270)) {
@@ -207,32 +171,33 @@ static void sample_collect_work_handler(struct k_work *work)
 		err = sensor_sample_fetch(g_bmi270);
 		if (err && err != -ENOTSUP) {
 			LOG_ERR("sensor_sample_fetch bmi270, error: %d", err);
-			goto reschedule;
+			return;
 		}
 
 		err = sensor_channel_get(g_bmi270, SENSOR_CHAN_ACCEL_XYZ, accel_vals);
 		if (err && err != -ENOTSUP) {
 			LOG_ERR("sensor_channel_get accel_xyz, error: %d", err);
-			goto reschedule;
+			return;
 		}
 
-		sample.accel_hp[0] = sensor_value_to_double(&accel_vals[0]);
-		sample.accel_hp[1] = sensor_value_to_double(&accel_vals[1]);
-		sample.accel_hp[2] = sensor_value_to_double(&accel_vals[2]);
+		batch_msg.accel_hp[0][idx] = sensor_value_to_double(&accel_vals[0]);
+		batch_msg.accel_hp[1][idx] = sensor_value_to_double(&accel_vals[1]);
+		batch_msg.accel_hp[2][idx] = sensor_value_to_double(&accel_vals[2]);
 
 		err = sensor_channel_get(g_bmi270, SENSOR_CHAN_GYRO_XYZ, gyro_vals);
 		if (err && err != -ENOTSUP) {
 			LOG_ERR("sensor_channel_get gyro_xyz, error: %d", err);
-			goto reschedule;
+			return;
 		}
 
-		sample.gyro_hp[0] = sensor_value_to_double(&gyro_vals[0]);
-		sample.gyro_hp[1] = sensor_value_to_double(&gyro_vals[1]);
-		sample.gyro_hp[2] = sensor_value_to_double(&gyro_vals[2]);
+		batch_msg.gyro_hp[0][idx] = sensor_value_to_double(&gyro_vals[0]);
+		batch_msg.gyro_hp[1][idx] = sensor_value_to_double(&gyro_vals[1]);
+		batch_msg.gyro_hp[2][idx] = sensor_value_to_double(&gyro_vals[2]);
 
-		LOG_DBG("BMI270 sampled: accel_hp[%.2f, %.2f, %.2f] g, gyro_hp[%.2f, %.2f, %.2f] dps",
-			(double)sample.accel_hp[0], (double)sample.accel_hp[1], (double)sample.accel_hp[2],
-			(double)sample.gyro_hp[0], (double)sample.gyro_hp[1], (double)sample.gyro_hp[2]);
+		LOG_DBG("BMI270 sampled[%d]: accel_hp[%.2f, %.2f, %.2f] g, gyro_hp[%.2f, %.2f, %.2f] dps",
+			idx,
+			(double)batch_msg.accel_hp[0][idx], (double)batch_msg.accel_hp[1][idx], (double)batch_msg.accel_hp[2][idx],
+			(double)batch_msg.gyro_hp[0][idx], (double)batch_msg.gyro_hp[1][idx], (double)batch_msg.gyro_hp[2][idx]);
 	}
 
 	/* Fetch data from ADXL367 (accelerometer - low power) */
@@ -243,63 +208,62 @@ static void sample_collect_work_handler(struct k_work *work)
 		err = sensor_sample_fetch(g_adxl367);
 		if (err && err != -ENOTSUP) {
 			LOG_ERR("sensor_sample_fetch adxl367, error: %d", err);
-			goto reschedule;
+			return;
 		}
 
 		err = sensor_channel_get(g_adxl367, SENSOR_CHAN_ACCEL_XYZ, accel_vals);
 		if (err && err != -ENOTSUP) {
 			LOG_ERR("sensor_channel_get accel_lp_xyz, error: %d", err);
-			goto reschedule;
+			return;
 		}
 
-		sample.accel_lp[0] = sensor_value_to_double(&accel_vals[0]);
-		sample.accel_lp[1] = sensor_value_to_double(&accel_vals[1]);
-		sample.accel_lp[2] = sensor_value_to_double(&accel_vals[2]);
+		batch_msg.accel_lp[0][idx] = sensor_value_to_double(&accel_vals[0]);
+		batch_msg.accel_lp[1][idx] = sensor_value_to_double(&accel_vals[1]);
+		batch_msg.accel_lp[2][idx] = sensor_value_to_double(&accel_vals[2]);
 
-		LOG_DBG("ADXL367 sampled: accel_lp[%.2f, %.2f, %.2f] g",
-			(double)sample.accel_lp[0], (double)sample.accel_lp[1], (double)sample.accel_lp[2]);
+		LOG_DBG("ADXL367 sampled[%d]: accel_lp[%.2f, %.2f, %.2f] g",
+			idx,
+			(double)batch_msg.accel_lp[0][idx], (double)batch_msg.accel_lp[1][idx], (double)batch_msg.accel_lp[2][idx]);
 	}
 
-	sample.timestamp = k_uptime_get();
-	err = date_time_now(&sample.timestamp);
+	batch_msg.timestamp[idx] = k_uptime_get();
+	err = date_time_now(&batch_msg.timestamp[idx]);
 	if (err != 0 && err != -ENODATA) {
 		LOG_WRN("date_time_now, error: %d", err);
 	}
 
-	/* Add sample to ring buffer */
-	if (ring_buf_put(&sample_ring_buf, (uint8_t *)&sample, sizeof(sample)) != sizeof(sample)) {
-		LOG_WRN("Sample ring buffer full, dropping sample");
+	/* Include pressure data every ENV_SAMPLES_BETWEEN_PUBLISH samples */
+	imu_sample_count++;
+	if (imu_sample_count >= ENV_SAMPLES_BETWEEN_PUBLISH) {
+		batch_msg.pressure[idx] = latest_pressure;
+		imu_sample_count = 0;
+		LOG_DBG("Adding pressure data[%d]: press=%.2f Pa",
+			idx,
+			(double)batch_msg.pressure[idx]);
 	}
 
-	/* Trigger sample publishing work after batching SAMPLES_PER_BATCH samples */
-	sample_count++;
-	if (sample_count >= SAMPLES_PER_BATCH) {
-		sample_count = 0;
-		k_work_submit(&sample_publish_work);
+	/* Increment sample count */
+	batch_msg.sample_count++;
+
+	/* Trigger publish when batch is full */
+	if (batch_msg.sample_count >= SAMPLES_PER_BATCH) {
+		LOG_DBG("Batch full (%d samples), submitting publish work", batch_msg.sample_count);
+		k_work_schedule(&sample_publish_work, K_NO_WAIT);
 	}
 
 	/* Work completes without rescheduling - only fires on interrupt triggers */
 	return;
-
-reschedule:
-	/* Error fallback: reschedule work to retry if sample collection fails.
-	 * This acts as a safety net to ensure samples are eventually collected
-	 * even if something goes wrong with the interrupt. */
-	LOG_ERR("Sample collection error detected, enabling periodic fallback (%d ms)", FS_MS);
-	k_work_schedule(&sample_collect_work, K_MSEC(FS_MS));
 }
 
 /* Periodic work handler to sample BME680 environmental sensor at 1 Hz */
 static void env_sample_work_handler(struct k_work *work)
 {
 	int err;
-	struct sensor_value temp = { 0 };
 	struct sensor_value press = { 0 };
-	struct sensor_value humidity = { 0 };
 
 	ARG_UNUSED(work);
 
-	LOG_DBG("env_sample_work_handler: starting BME680 sample");
+	LOG_DBG("env_sample_work_handler: starting BME680 pressure sample");
 
 	if (!g_bme680) {
 		LOG_WRN("env_sample_work_handler: g_bme680 is NULL");
@@ -317,34 +281,17 @@ static void env_sample_work_handler(struct k_work *work)
 		goto reschedule_env;
 	}
 
-	err = sensor_channel_get(g_bme680, SENSOR_CHAN_AMBIENT_TEMP, &temp);
-	if (err) {
-		LOG_WRN("env_sample_work_handler: sensor_channel_get TEMP error: %d", err);
-		goto reschedule_env;
-	}
-
 	err = sensor_channel_get(g_bme680, SENSOR_CHAN_PRESS, &press);
 	if (err) {
 		LOG_WRN("env_sample_work_handler: sensor_channel_get PRESS error: %d", err);
 		goto reschedule_env;
 	}
 
-	err = sensor_channel_get(g_bme680, SENSOR_CHAN_HUMIDITY, &humidity);
-	if (err) {
-		LOG_WRN("env_sample_work_handler: sensor_channel_get HUMIDITY error: %d", err);
-		goto reschedule_env;
-	}
-
-	/* Update latest environmental values */
-	latest_temperature = (float)sensor_value_to_double(&temp);
+	/* Update latest pressure value */
 	latest_pressure = (float)sensor_value_to_double(&press);
-	latest_humidity = (float)sensor_value_to_double(&humidity);
 
-	LOG_INF("env_sample_work_handler: BME680 sampled successfully - "
-		"temp=%.2f C, press=%.2f Pa, humidity=%.2f %% "
-		"(raw: temp.val1=%d temp.val2=%d, press.val1=%d, humid.val1=%d)",
-		(double)latest_temperature, (double)latest_pressure, (double)latest_humidity,
-		temp.val1, temp.val2, press.val1, humidity.val1);
+	LOG_INF("env_sample_work_handler: BME680 pressure sampled - press=%.2f Pa",
+		(double)latest_pressure);
 
 reschedule_env:
 	/* Reschedule for next 1 Hz sampling interval */
@@ -517,67 +464,11 @@ static int sensors_init(const struct device *bmi270, const struct device *adxl36
 
 
 
-static void sample_sensors(const struct device *const bme680)
-{
-	int err;
-	struct sensor_value temp = { 0 };
-	struct sensor_value press = { 0 };
-	struct sensor_value humidity = { 0 };
-
-	err = sensor_sample_fetch(bme680);
-	if (err) {
-		LOG_ERR("sensor_sample_fetch, error: %d", err);
-		SEND_FATAL_ERROR();
-		return;
-	}
-
-	err = sensor_channel_get(bme680, SENSOR_CHAN_AMBIENT_TEMP, &temp);
-	if (err) {
-		LOG_ERR("sensor_channel_get, error: %d", err);
-		SEND_FATAL_ERROR();
-		return;
-	}
-
-	err = sensor_channel_get(bme680, SENSOR_CHAN_PRESS, &press);
-	if (err) {
-		LOG_ERR("sensor_channel_get, error: %d", err);
-		SEND_FATAL_ERROR();
-		return;
-	}
-
-	err = sensor_channel_get(bme680, SENSOR_CHAN_HUMIDITY, &humidity);
-	if (err) {
-		LOG_ERR("sensor_channel_get, error: %d", err);
-		SEND_FATAL_ERROR();
-		return;
-	}
-
-	struct environmental_msg msg = {
-		.type = ENVIRONMENTAL_SENSOR_SAMPLE_RESPONSE,
-		.temperature = sensor_value_to_double(&temp),
-		.pressure = sensor_value_to_double(&press),
-		.humidity = sensor_value_to_double(&humidity),
-		.timestamp = k_uptime_get(),
-	};
-
-	err = date_time_now(&msg.timestamp);
-	if (err != 0 && err != -ENODATA) {
-		LOG_ERR("date_time_now, error: %d", err);
-		SEND_FATAL_ERROR();
-		return;
-	}
-
-	/* Log the environmental values and limit to 2 decimals */
-	LOG_DBG("Temperature: %.2f C, Pressure: %.2f Pa, Humidity: %.2f %%",
-		(double)msg.temperature, (double)msg.pressure, (double)msg.humidity);
-
-	err = zbus_chan_pub(&environmental_chan, &msg, PUB_TIMEOUT);
-	if (err) {
-		LOG_ERR("zbus_chan_pub, error: %d", err);
-		SEND_FATAL_ERROR();
-		return;
-	}
-}
+/* Note: On-demand sampling removed.
+ * Environmental data is now sampled continuously at 1 Hz via env_sample_work_handler()
+ * and included in batch messages indirectly. ENVIRONMENTAL_SENSOR_SAMPLE_REQUEST
+ * messages are ignored as we don't support on-demand sampling anymore.
+ */
 
 static void env_wdt_callback(int channel_id, void *user_data)
 {
@@ -597,9 +488,8 @@ static enum smf_state_result state_running_run(void *obj)
 		struct environmental_msg msg = MSG_TO_ENVIRONMENTAL_MSG(state_object->msg_buf);
 
 		if (msg.type == ENVIRONMENTAL_SENSOR_SAMPLE_REQUEST) {
-			LOG_DBG("Environmental values sample request received, getting data");
-			sample_sensors(state_object->bme680);
-
+			/* On-demand sampling not supported - environmental data is sampled continuously */
+			LOG_DBG("Environmental sample request ignored (continuous sampling mode)");
 			return SMF_EVENT_HANDLED;
 		}
 	}
@@ -624,8 +514,7 @@ static void env_module_thread(void)
 
 	LOG_DBG("Environmental module task started");
 
-	/* Initialize ring buffer for sensor samples */
-	ring_buf_init(&sample_ring_buf, SAMPLE_BUFFER_SIZE, sample_buffer);
+	/* Ring buffer removed - batch message accumulates samples directly */
 
 	/* Initialize sensor triggers and start periodic sampling */
 	err = sensors_init(environmental_state.bmi270, environmental_state.adxl367, environmental_state.bme680);

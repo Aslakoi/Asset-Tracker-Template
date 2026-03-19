@@ -352,8 +352,8 @@ static void handle_data_message(const struct storage_state *state_object,
 
 	type->extract_data(buf, (void *)data);
 
-	LOG_INF("Data size: %lu", type->data_size);
-	LOG_INF("Bytes written: %lu", bytes_written);
+	LOG_INF("Data size: %zu", type->data_size);
+	LOG_INF("Bytes written: %zu", bytes_written);
 
 	if (bytes_written + type->data_size > max_bytes) {
 		LOG_WRN("Flash full limit reached, stopping program");

@@ -14,6 +14,7 @@
 extern "C" {
 #endif
 
+#define SAMPLES_PER_BATCH 30  /* Publish every x samples to batch and reduce zbus load */
 
 /* Channels provided by this module */
 ZBUS_CHAN_DECLARE(
@@ -39,23 +40,20 @@ enum environmental_msg_type {
 struct environmental_msg {
 	enum environmental_msg_type type;
 
-	/** Contains the current temperature in celsius. */
-	float temperature;
+	/** Number of samples currently in this batch message (0 to SAMPLES_PER_BATCH) */
+	uint8_t sample_count;
 
-	/** Contains the current humidity in percentage. */
-	float humidity;
-
-	/** Contains the current pressure in Pa. */
-	float pressure;
+	/** Contains the current pressure in Pa (from BME680). */
+	float pressure[SAMPLES_PER_BATCH];
 
 	/** Contains the current acceleration values in g. */
-	float accel_hp[3];
+	float accel_hp[3][SAMPLES_PER_BATCH];
 
 	/** Contains the current gyroscope values in dps. */
-	float gyro_hp[3];
+	float gyro_hp[3][SAMPLES_PER_BATCH];
 
 	/** Contains the current low-power acceleration values in g. */
-	float accel_lp[3];
+	float accel_lp[3][SAMPLES_PER_BATCH];
 
 	/** Timestamp when the sample was taken in milliseconds.
 	 *  This is either:
@@ -63,7 +61,7 @@ struct environmental_msg {
 	 * - Uptime in milliseconds if the system clock was not synchronized at sampling time.
 	 * Only valid for ENVIRONMENTAL_SENSOR_SAMPLE_RESPONSE events.
 	 */
-	int64_t timestamp;
+	int64_t timestamp[SAMPLES_PER_BATCH];
 };
 
 #define MSG_TO_ENVIRONMENTAL_MSG(_msg)	(*(const struct environmental_msg *)_msg)
