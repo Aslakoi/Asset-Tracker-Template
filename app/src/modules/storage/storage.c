@@ -524,7 +524,7 @@ static void environmental_stream_debug_print(void)
 			float gyro_z = (float)msg.gyro_hp[2][0] / GYRO_SCALE;
 
 			LOG_INF("  Sample 0 - Accel: (%.3f, %.3f, %.3f) g, Gyro: (%.2f, %.2f, %.2f) dps",
-				accel_x, accel_y, accel_z, gyro_x, gyro_y, gyro_z);
+				(double)accel_x, (double)accel_y, (double)accel_z, (double)gyro_x, (double)gyro_y, (double)gyro_z);
 		}
 
 		LOG_INF("");

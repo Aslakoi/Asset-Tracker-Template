@@ -17,7 +17,7 @@
 #include "environmental.h"
 #include "environmental_msgq.h"
 
-#define FS 10 /* Sampling frequency in Hz */
+#define FS 100 /* Sampling frequency in Hz */
 #define FS_MS 1000 / FS /* Sampling frequency in milliseconds (100ms at 10 Hz) */
 
 #define ENV_FS 0.1 /* Environmental sensor (BME680) sampling frequency in Hz */
@@ -151,15 +151,15 @@ static void sample_publish_work_handler(struct k_work *work)
 		float accel_lp_y = (float)batch_msg.accel_lp[1][0] / ACCEL_SCALE;
 		float accel_lp_z = (float)batch_msg.accel_lp[2][0] / ACCEL_SCALE;
 		
-		LOG_INF("=== SENSOR READINGS (Sample 0) ===");
-		LOG_INF("  BMI270 Accel: (%.3f, %.3f, %.3f) g", accel_hp_x, accel_hp_y, accel_hp_z);
-		LOG_INF("  BMI270 Gyro:  (%.2f, %.2f, %.2f) dps", gyro_hp_x, gyro_hp_y, gyro_hp_z);
-		LOG_INF("  ADXL367 Accel: (%.3f, %.3f, %.3f) g", accel_lp_x, accel_lp_y, accel_lp_z);
-		LOG_INF("  BME680 Pressure: %d Pa %s", batch_msg.pressure, 
+		LOG_DBG("=== SENSOR READINGS (Sample 0) ===");
+		LOG_DBG("  BMI270 Accel: (%.3f, %.3f, %.3f) g", (double)accel_hp_x, (double)accel_hp_y, (double)accel_hp_z);
+		LOG_DBG("  BMI270 Gyro:  (%.2f, %.2f, %.2f) dps", (double)gyro_hp_x, (double)gyro_hp_y, (double)gyro_hp_z);
+		LOG_DBG("  ADXL367 Accel: (%.3f, %.3f, %.3f) g", (double)accel_lp_x, (double)accel_lp_y, (double)accel_lp_z);
+		LOG_DBG("  BME680 Pressure: %d Pa %s", batch_msg.pressure, 
 			batch_msg.pressure_valid ? "(valid)" : "(invalid)");
-		LOG_INF("  Timestamp: %u ms, Samples in batch: %u", 
+		LOG_DBG("  Timestamp: %u ms, Samples in batch: %u", 
 			batch_msg.batch_timestamp_ms, batch_msg.sample_count);
-		LOG_INF("=== END SENSOR READINGS ===");
+		LOG_DBG("=== END SENSOR READINGS ===");
 	}
 
 	/* Use blocking write with 500ms timeout to let storage thread drain the queue.
