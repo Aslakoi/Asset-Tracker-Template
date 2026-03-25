@@ -688,7 +688,6 @@ static void storage_clear(void)
 	LOG_INF("=== Storage Clear Starting ===");
 
 	/* Clear all stored data from generic backend */
-	LOG_INF("Clearing generic backend storage...");
 	err = storage_backend_get()->clear();
 	if (err) {
 		LOG_ERR("Failed to clear storage backend, error: %d", err);
