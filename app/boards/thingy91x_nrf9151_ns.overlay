@@ -24,7 +24,7 @@
 
 &uart0 {
 	status = "okay";
-	current-speed = <1000000>;
+	current-speed = <115200>;
 };
 
 /* Switch to nrf7000 emulation so that scan-only mode is used. */

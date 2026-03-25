@@ -111,12 +111,29 @@ static int cmd_storage_stats(const struct shell *sh, size_t argc, char **argv)
 	return 0;
 }
 
+static int cmd_storage_env_print(const struct shell *sh, size_t argc, char **argv)
+{
+#if IS_ENABLED(CONFIG_APP_ENVIRONMENTAL)
+	ARG_UNUSED(argc);
+	ARG_UNUSED(argv);
+
+	shell_print(sh, "Reading stored environmental data...");
+	storage_env_print();
+
+	return 0;
+#else
+	shell_error(sh, "Environmental sensor support is not enabled.");
+	return -ENOTSUP;
+#endif /* CONFIG_APP_ENVIRONMENTAL */
+}
+
 SHELL_STATIC_SUBCMD_SET_CREATE(sub_cmds,
 	SHELL_CMD(flush, NULL, "Flush stored data", cmd_storage_flush),
 	SHELL_CMD(batch_request, NULL, "Request data from batch", cmd_storage_batch_request),
 	SHELL_CMD(clear, NULL, "Clear all stored data", cmd_storage_clear),
 	SHELL_CMD(batch_close, NULL, "Close batch session", cmd_storage_batch_close),
 	SHELL_CMD(stats, NULL, "Show storage statistics", cmd_storage_stats),
+	SHELL_CMD(env_print, NULL, "Print stored environmental data", cmd_storage_env_print),
 	SHELL_SUBCMD_SET_END
 );
 

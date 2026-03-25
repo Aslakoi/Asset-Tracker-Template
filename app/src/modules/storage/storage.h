@@ -169,6 +169,9 @@ int storage_batch_read(struct storage_data_item *out_item,
 ZBUS_CHAN_DECLARE(storage_chan);
 ZBUS_CHAN_DECLARE(storage_data_chan);
 
+/* Debug interface: Print stored environmental data (shell command) */
+void storage_env_print(void);
+
 #ifdef __cplusplus
 }
 #endif

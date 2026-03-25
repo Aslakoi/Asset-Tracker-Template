@@ -472,8 +472,13 @@ static int send_storage_data_to_cloud(const struct storage_data_item *item)
 	if (item->type == STORAGE_TYPE_ENVIRONMENTAL) {
 		const struct environmental_msg *env = &item->data.ENVIRONMENTAL;
 
-		/* Convert timestamp to unix time */
-		timestamp_ms = env->timestamp;
+		/* Use batch timestamp (unix time ms or uptime ms) */
+		if (env->sample_count > 0) {
+			timestamp_ms = env->batch_timestamp_ms;
+		} else {
+			LOG_WRN("Environmental data has no samples");
+			return 0;
+		}
 
 		err = handle_data_timestamp(&timestamp_ms);
 		if (err) {
