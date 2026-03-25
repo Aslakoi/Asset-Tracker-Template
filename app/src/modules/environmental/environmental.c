@@ -15,26 +15,33 @@
 
 #include "app_common.h"
 #include "environmental.h"
+#include "environmental_msgq.h"
 
-#define FS 25 /* Sampling frequency in Hz */
-#define FS_MS 1000 / FS /* Sampling frequency in milliseconds (1000/1) */
+#define FS 10 /* Sampling frequency in Hz */
+#define FS_MS 1000 / FS /* Sampling frequency in milliseconds (100ms at 10 Hz) */
 
-#define ENV_FS 1 /* Environmental sensor (BME680) sampling frequency in Hz */
-#define ENV_FS_MS 1000 / ENV_FS /* Environmental sensor sampling frequency in milliseconds */
+#define ENV_FS 0.1 /* Environmental sensor (BME680) sampling frequency in Hz */
+#define ENV_FS_MS 10000/* Environmental sensor sampling frequency in milliseconds (1000/0.1) */
 #define ENV_SAMPLES_BETWEEN_PUBLISH 50 /* Include environmental data in every Nth IMU message */
 
 /* Batch message accumulation */
 static struct environmental_msg batch_msg = {
 	.type = ENVIRONMENTAL_SENSOR_SAMPLE_RESPONSE,
 	.sample_count = 0,
+	.batch_timestamp_ms = 0,
+	.pressure = 0,
+	.pressure_valid = false,
 };
 static uint8_t imu_sample_count = 0;  /* Counter for IMU samples to include pressure periodically */
 
-/* Latest environmental sensor readings (updated at 1 Hz) */
-static float latest_pressure = 0.0f;
+/* Latest environmental sensor readings (updated at 0.1 Hz) */
+static int32_t latest_pressure_pa = 0;  /* Pressure in Pa as fixed-point int32_t */
 LOG_MODULE_REGISTER(environmental, CONFIG_APP_ENVIRONMENTAL_LOG_LEVEL);
 
-/* Define channels provided by this module */
+/* Environmental data now flows via message queue (environmental_msgq.h) only,not zbus.
+ * Channel definition below is only for storage_data structure compatibility.
+ * It won't be used for pub/sub - storage reads directly from msgq.
+ */
 ZBUS_CHAN_DEFINE(environmental_chan,
 		 struct environmental_msg,
 		 NULL,
@@ -42,12 +49,6 @@ ZBUS_CHAN_DEFINE(environmental_chan,
 		 ZBUS_OBSERVERS_EMPTY,
 		 ZBUS_MSG_INIT(0)
 );
-
-/* Register subscriber */
-ZBUS_MSG_SUBSCRIBER_DEFINE(environmental);
-
-/* Observe channels */
-ZBUS_CHAN_ADD_OBS(environmental_chan, environmental, 0);
 
 #define MAX_MSG_SIZE sizeof(struct environmental_msg)
 
@@ -82,12 +83,12 @@ struct environmental_state_object {
 
 	const struct device *const bmi270;
 
-	float accel_hp[3][SAMPLES_PER_BATCH];
-	float gyro_hp[3][SAMPLES_PER_BATCH];
+	//float accel_hp[3][SAMPLES_PER_BATCH];
+	//float gyro_hp[3][SAMPLES_PER_BATCH];
 
 	const struct device *const adxl367;
 
-	float accel_lp[3][SAMPLES_PER_BATCH];
+	//float accel_lp[3][SAMPLES_PER_BATCH];
 };
 
 
@@ -98,22 +99,26 @@ static const struct device *g_adxl367;
 static const struct device *g_bme680;
 
 /* Forward declarations */
-static enum smf_state_result state_running_run(void *obj);
 static void sample_publish_work_handler(struct k_work *work);
 static void sample_collect_work_handler(struct k_work *work);
 static void env_sample_work_handler(struct k_work *work);
 
-/* Work items for sensor sampling */
+/* Dedicated workqueue for environmental sampling at priority 11.
+ * Priority 11 is between storage thread (12) and system workqueue (-1).
+ * This prevents environmental work from starving the storage thread while
+ * allowing environmental to be scheduled when storage is not blocking on I/O.
+ */
+static struct k_work_q environmental_workqueue;
+static K_THREAD_STACK_DEFINE(environmental_workqueue_stack, 2048);
+
+/* Work items for sensor sampling - use dedicated environmental workqueue */
 static K_WORK_DELAYABLE_DEFINE(sample_publish_work, sample_publish_work_handler);
 static K_WORK_DELAYABLE_DEFINE(sample_collect_work, sample_collect_work_handler);
 static K_WORK_DELAYABLE_DEFINE(env_sample_work, env_sample_work_handler);
 
-/* State machine definition */
-static const struct smf_state states[] = {
-	[STATE_RUNNING] = SMF_CREATE_STATE(NULL, state_running_run, NULL, NULL, NULL),
-};
+/* State machine no longer used - environmental is fully asynchronous */
 
-/* Publish accumulated batch message to zbus */
+/* Publish accumulated batch message to pipe */
 static void sample_publish_work_handler(struct k_work *work)
 {
 	int err;
@@ -125,28 +130,30 @@ static void sample_publish_work_handler(struct k_work *work)
 		return;
 	}
 
-	LOG_INF("Publishing batch with %d samples",
-		batch_msg.sample_count);
+	LOG_INF("Publishing batch with %d samples (msgq, pressure_valid=%d)",
+		batch_msg.sample_count, batch_msg.pressure_valid);
 
-	err = zbus_chan_pub(&environmental_chan, &batch_msg, PUB_TIMEOUT);
+	/* Use blocking write with 500ms timeout to let storage thread drain the queue.
+	 * Do NOT retry aggressively (1ms loops starve the storage thread).
+	 * Increased timeout to accommodate LittleFS flash write latency (50-200ms).
+	 * Send batch_msg directly without stack copy (RAM optimization).
+	 */
+	err = environmental_msgq_write(&batch_msg, K_NO_WAIT);
 	if (err) {
-		if (err == -ENOMEM || err == -EAGAIN) {
-			/* Temporary resource exhaustion (net_buf pool full) - retry later */
-			LOG_WRN("zbus_chan_pub batch failed with %d (resource issue), retrying in 10ms", err);
-			k_work_reschedule(&sample_publish_work, K_MSEC(10));
-			return;
-		} else {
-			LOG_ERR("zbus_chan_pub batch, error: %d", err);
-			SEND_FATAL_ERROR();
-			return;
-		}
+		LOG_WRN("environmental_msgq_write failed: %d (msgq full or timeout)", err);
+		/* Don't retry - the msgq full is backpressure. Storage thread will drain it.
+		 * Drop this batch to prevent sample accumulation. */
+		batch_msg.sample_count = 0;
+		return;
 	}
 
-	/* Reset batch message for next batch */
+	/* Reset batch message for next batch only after successful write */
+	batch_msg.sample_count = 0;
+	batch_msg.pressure_valid = false;
 	batch_msg.sample_count = 0;
 }
 
-/* Periodic work handler to sample sensors at 50 Hz and accumulate into batch message */
+/* Periodic work handler to sample sensors at x Hz and accumulate into batch message */
 static void sample_collect_work_handler(struct k_work *work)
 {
 	int err;
@@ -166,6 +173,7 @@ static void sample_collect_work_handler(struct k_work *work)
 	if (g_bmi270 && device_is_ready(g_bmi270)) {
 		struct sensor_value accel_vals[3] = { 0 };
 		struct sensor_value gyro_vals[3] = { 0 };
+		double accel_d[3], gyro_d[3];
 
 		/* Full fetch ensures atomic read of all sensor data */
 		err = sensor_sample_fetch(g_bmi270);
@@ -180,9 +188,14 @@ static void sample_collect_work_handler(struct k_work *work)
 			return;
 		}
 
-		batch_msg.accel_hp[0][idx] = sensor_value_to_double(&accel_vals[0]);
-		batch_msg.accel_hp[1][idx] = sensor_value_to_double(&accel_vals[1]);
-		batch_msg.accel_hp[2][idx] = sensor_value_to_double(&accel_vals[2]);
+		accel_d[0] = sensor_value_to_double(&accel_vals[0]);
+		accel_d[1] = sensor_value_to_double(&accel_vals[1]);
+		accel_d[2] = sensor_value_to_double(&accel_vals[2]);
+
+		/* Convert to fixed-point: value * 1000 = g */
+		batch_msg.accel_hp[0][idx] = (int16_t)(accel_d[0] * ACCEL_SCALE);
+		batch_msg.accel_hp[1][idx] = (int16_t)(accel_d[1] * ACCEL_SCALE);
+		batch_msg.accel_hp[2][idx] = (int16_t)(accel_d[2] * ACCEL_SCALE);
 
 		err = sensor_channel_get(g_bmi270, SENSOR_CHAN_GYRO_XYZ, gyro_vals);
 		if (err && err != -ENOTSUP) {
@@ -190,19 +203,24 @@ static void sample_collect_work_handler(struct k_work *work)
 			return;
 		}
 
-		batch_msg.gyro_hp[0][idx] = sensor_value_to_double(&gyro_vals[0]);
-		batch_msg.gyro_hp[1][idx] = sensor_value_to_double(&gyro_vals[1]);
-		batch_msg.gyro_hp[2][idx] = sensor_value_to_double(&gyro_vals[2]);
+		gyro_d[0] = sensor_value_to_double(&gyro_vals[0]);
+		gyro_d[1] = sensor_value_to_double(&gyro_vals[1]);
+		gyro_d[2] = sensor_value_to_double(&gyro_vals[2]);
+
+		/* Convert to fixed-point: value * 100 = dps */
+		batch_msg.gyro_hp[0][idx] = (int16_t)(gyro_d[0] * GYRO_SCALE);
+		batch_msg.gyro_hp[1][idx] = (int16_t)(gyro_d[1] * GYRO_SCALE);
+		batch_msg.gyro_hp[2][idx] = (int16_t)(gyro_d[2] * GYRO_SCALE);
 
 		LOG_DBG("BMI270 sampled[%d]: accel_hp[%.2f, %.2f, %.2f] g, gyro_hp[%.2f, %.2f, %.2f] dps",
-			idx,
-			(double)batch_msg.accel_hp[0][idx], (double)batch_msg.accel_hp[1][idx], (double)batch_msg.accel_hp[2][idx],
-			(double)batch_msg.gyro_hp[0][idx], (double)batch_msg.gyro_hp[1][idx], (double)batch_msg.gyro_hp[2][idx]);
+			idx, accel_d[0], accel_d[1], accel_d[2],
+			gyro_d[0], gyro_d[1], gyro_d[2]);
 	}
 
 	/* Fetch data from ADXL367 (accelerometer - low power) */
 	if (g_adxl367 && device_is_ready(g_adxl367)) {
 		struct sensor_value accel_vals[3] = { 0 };
+		double accel_lp_d[3];
 
 		/* Full fetch ensures atomic read of all sensor data */
 		err = sensor_sample_fetch(g_adxl367);
@@ -217,29 +235,55 @@ static void sample_collect_work_handler(struct k_work *work)
 			return;
 		}
 
-		batch_msg.accel_lp[0][idx] = sensor_value_to_double(&accel_vals[0]);
-		batch_msg.accel_lp[1][idx] = sensor_value_to_double(&accel_vals[1]);
-		batch_msg.accel_lp[2][idx] = sensor_value_to_double(&accel_vals[2]);
+		accel_lp_d[0] = sensor_value_to_double(&accel_vals[0]);
+		accel_lp_d[1] = sensor_value_to_double(&accel_vals[1]);
+		accel_lp_d[2] = sensor_value_to_double(&accel_vals[2]);
+
+		/* Convert to fixed-point: value * 1000 = g */
+		batch_msg.accel_lp[0][idx] = (int16_t)(accel_lp_d[0] * ACCEL_SCALE);
+		batch_msg.accel_lp[1][idx] = (int16_t)(accel_lp_d[1] * ACCEL_SCALE);
+		batch_msg.accel_lp[2][idx] = (int16_t)(accel_lp_d[2] * ACCEL_SCALE);
 
 		LOG_DBG("ADXL367 sampled[%d]: accel_lp[%.2f, %.2f, %.2f] g",
-			idx,
-			(double)batch_msg.accel_lp[0][idx], (double)batch_msg.accel_lp[1][idx], (double)batch_msg.accel_lp[2][idx]);
+			idx, accel_lp_d[0], accel_lp_d[1], accel_lp_d[2]);
 	}
 
-	batch_msg.timestamp[idx] = k_uptime_get();
-	err = date_time_now(&batch_msg.timestamp[idx]);
-	if (err != 0 && err != -ENODATA) {
-		LOG_WRN("date_time_now, error: %d", err);
+	/* Initialize batch timestamp on first sample (unix time in ms or uptime in ms) */
+	if (batch_msg.sample_count == 0) {
+		uint32_t sample_time_ms = k_uptime_get();
+		uint64_t unix_time_ms = sample_time_ms;
+
+		err = date_time_now(&unix_time_ms);
+		if (err == 0) {
+			/* Unix time obtained successfully */
+			batch_msg.batch_timestamp_ms = (uint32_t)(unix_time_ms & 0xFFFFFFFFUL);
+		} else if (err == -ENODATA) {
+			/* Not synced yet, use uptime */
+			batch_msg.batch_timestamp_ms = sample_time_ms;
+		} else {
+			LOG_WRN("date_time_now error: %d", err);
+			batch_msg.batch_timestamp_ms = sample_time_ms;
+		}
 	}
 
-	/* Include pressure data every ENV_SAMPLES_BETWEEN_PUBLISH samples */
+	/* Store timestamp delta as sample_index * sample_period (100ms at 10 Hz).
+	 * This avoids tracking absolute time and prevents overflow issues.
+	 * Delta is approximate but accurate for periodic sampling.
+	 */
+	uint16_t delta_ms = idx * FS_MS;  /* 100ms per sample at 10 Hz */
+	if (delta_ms > UINT16_MAX) {
+		delta_ms = UINT16_MAX;  /* Clamp to max uint16_t */
+		LOG_WRN("Timestamp delta exceeds uint16_t at sample %d", idx);
+	}
+	batch_msg.timestamp_delta_ms[idx] = delta_ms;
+
+	/* Include pressure data once per batch when available */
 	imu_sample_count++;
-	if (imu_sample_count >= ENV_SAMPLES_BETWEEN_PUBLISH) {
-		batch_msg.pressure[idx] = latest_pressure;
+	if (imu_sample_count >= ENV_SAMPLES_BETWEEN_PUBLISH && batch_msg.sample_count == 0) {
+		batch_msg.pressure = latest_pressure_pa;
+		batch_msg.pressure_valid = true;
 		imu_sample_count = 0;
-		LOG_DBG("Adding pressure data[%d]: press=%.2f Pa",
-			idx,
-			(double)batch_msg.pressure[idx]);
+		LOG_DBG("Batch pressure updated: %d Pa", batch_msg.pressure);
 	}
 
 	/* Increment sample count */
@@ -248,7 +292,7 @@ static void sample_collect_work_handler(struct k_work *work)
 	/* Trigger publish when batch is full */
 	if (batch_msg.sample_count >= SAMPLES_PER_BATCH) {
 		LOG_DBG("Batch full (%d samples), submitting publish work", batch_msg.sample_count);
-		k_work_schedule(&sample_publish_work, K_NO_WAIT);
+		k_work_schedule_for_queue(&environmental_workqueue, &sample_publish_work, K_NO_WAIT);
 	}
 
 	/* Work completes without rescheduling - only fires on interrupt triggers */
@@ -287,15 +331,16 @@ static void env_sample_work_handler(struct k_work *work)
 		goto reschedule_env;
 	}
 
-	/* Update latest pressure value */
-	latest_pressure = (float)sensor_value_to_double(&press);
+	/* Update latest pressure value as fixed-point int32_t */
+	double press_d = sensor_value_to_double(&press);
+	latest_pressure_pa = (int32_t)press_d;
 
 	LOG_INF("env_sample_work_handler: BME680 pressure sampled - press=%.2f Pa",
-		(double)latest_pressure);
+		press_d);
 
 reschedule_env:
 	/* Reschedule for next 1 Hz sampling interval */
-	k_work_schedule(&env_sample_work, K_MSEC(ENV_FS_MS));
+	k_work_schedule_for_queue(&environmental_workqueue, &env_sample_work, K_MSEC(ENV_FS_MS));
 }
 
 /* Sensor trigger callback for interrupt-based triggers */
@@ -304,12 +349,12 @@ static void sensor_trigger_callback(const struct device *sensor, const struct se
 	ARG_UNUSED(trigger);
 
 	LOG_DBG("Sensor data-ready trigger from %s, submitting sample work", sensor->name);
-	/* Offload work to system workqueue - keep ISR short.
+	/* Offload work to environmental workqueue - keep ISR short.
 	 * This follows the Zephyr ISR offloading pattern: signal a work item
 	 * to do interrupt-related processing outside of ISR context.
-	 * Use k_work_schedule with K_NO_WAIT for delayable work.
+	 * Use dedicated environmental workqueue at priority 11 to prevent starvation of storage thread.
 	 */
-	k_work_schedule(&sample_collect_work, K_NO_WAIT);
+	k_work_schedule_for_queue(&environmental_workqueue, &sample_collect_work, K_NO_WAIT);
 }
 
 /* Initialize sensor triggers and start periodic sampling */
@@ -423,22 +468,28 @@ static int sensors_init(const struct device *bmi270, const struct device *adxl36
 			LOG_DBG("ADXL367 initial fetch completed");
 		}
 
-		err = sensor_trigger_set(adxl367, &trig, sensor_trigger_callback);
+		/* Do not use ADXL367 as an independent pacing trigger.
+		 * We still read ADXL367 in sample_collect_work_handler().
+		 * Using only BMI270 trigger reduces collection frequency to actual 25 Hz
+		 * instead of ~50 Hz with both sensors triggering.
+		 */
+		/* err = sensor_trigger_set(adxl367, &trig, sensor_trigger_callback);
 		if (err) {
 			LOG_ERR("ADXL367 data-ready trigger not supported on this device, error: %d", err);
 		} else {
 			LOG_INF("ADXL367 data-ready trigger configured successfully");
 			adxl367_trigger_ok = 1;
 		}
+		*/
 	}
 
 	/* Only start periodic sampling as fallback if trigger setup failed completely */
-	if (!bmi270_trigger_ok || !adxl367_trigger_ok) {
+	if (!bmi270_trigger_ok && !adxl367_trigger_ok) {
 		LOG_INF("Interrupt-based triggers not available, starting periodic sampling at %d Hz (every %d ms)",
 			FS, FS_MS);
-		err = k_work_schedule(&sample_collect_work, K_MSEC(FS_MS));
+		err = k_work_schedule_for_queue(&environmental_workqueue, &sample_collect_work, K_MSEC(FS_MS));
 		if (err < 0) {
-			LOG_ERR("k_work_schedule sample_collect_work, error: %d", err);
+			LOG_ERR("k_work_schedule_for_queue sample_collect_work, error: %d", err);
 			return err;
 		}
 	} else {
@@ -447,12 +498,12 @@ static int sensors_init(const struct device *bmi270, const struct device *adxl36
 
 	/* Start environmental sensor (BME680) sampling at 1 Hz */
 	if (bme680 && device_is_ready(bme680)) {
-		err = k_work_schedule(&env_sample_work, K_MSEC(ENV_FS_MS));
+		err = k_work_schedule_for_queue(&environmental_workqueue, &env_sample_work, K_MSEC(ENV_FS_MS));
 		if (err < 0) {
-			LOG_ERR("k_work_schedule env_sample_work, error: %d", err);
+			LOG_ERR("k_work_schedule_for_queue env_sample_work, error: %d", err);
 			return err;
 		}
-		LOG_INF("Environmental sensor (BME680) sampling scheduled at %d Hz", ENV_FS);
+		LOG_INF("Environmental sensor (BME680) sampling scheduled at %.1f Hz", ENV_FS);
 	} else {
 		LOG_WRN("BME680 device not ready during initialization, environmental sampling disabled");
 	}
@@ -478,34 +529,12 @@ static void env_wdt_callback(int channel_id, void *user_data)
 	SEND_FATAL_ERROR_WATCHDOG_TIMEOUT();
 }
 
-/* State handlers */
-
-static enum smf_state_result state_running_run(void *obj)
-{
-	struct environmental_state_object const *state_object = obj;
-
-	if (&environmental_chan == state_object->chan) {
-		struct environmental_msg msg = MSG_TO_ENVIRONMENTAL_MSG(state_object->msg_buf);
-
-		if (msg.type == ENVIRONMENTAL_SENSOR_SAMPLE_REQUEST) {
-			/* On-demand sampling not supported - environmental data is sampled continuously */
-			LOG_DBG("Environmental sample request ignored (continuous sampling mode)");
-			return SMF_EVENT_HANDLED;
-		}
-	}
-
-	return SMF_EVENT_PROPAGATE;
-}
-
 static void env_module_thread(void)
 {
 	int err;
 	int task_wdt_id;
 	const uint32_t wdt_timeout_ms =
 		(CONFIG_APP_ENVIRONMENTAL_WATCHDOG_TIMEOUT_SECONDS * MSEC_PER_SEC);
-	const uint32_t execution_time_ms =
-		(CONFIG_APP_ENVIRONMENTAL_MSG_PROCESSING_TIMEOUT_SECONDS * MSEC_PER_SEC);
-	const k_timeout_t zbus_wait_ms = K_MSEC(wdt_timeout_ms - execution_time_ms);
 	static struct environmental_state_object environmental_state = {
 		.bme680 = DEVICE_DT_GET(DT_NODELABEL(bme680)),
 		.bmi270 = DEVICE_DT_GET(DT_NODELABEL(accelerometer_hp)),
@@ -513,6 +542,18 @@ static void env_module_thread(void)
 	};
 
 	LOG_DBG("Environmental module task started");
+
+	/* Initialize dedicated environmental workqueue at priority 13.
+	 * Priority 13 is LOWER priority than storage thread (12).
+	 * Lower number = higher priority in Zephyr.
+	 * This allows storage thread to preempt environmental work and drain the queue,
+	 * preventing environmental from starving the storage thread.
+	 */
+	k_work_queue_init(&environmental_workqueue);
+
+	k_work_queue_start(&environmental_workqueue, environmental_workqueue_stack,
+			   K_THREAD_STACK_SIZEOF(environmental_workqueue_stack),
+			   13, NULL);
 
 	/* Ring buffer removed - batch message accumulates samples directly */
 
@@ -531,7 +572,7 @@ static void env_module_thread(void)
 		return;
 	}
 
-	smf_set_initial(SMF_CTX(&environmental_state), &states[STATE_RUNNING]);
+	/* State machine no longer needed - environmental is fully asynchronous via triggers and work items */
 
 	while (true) {
 		err = task_wdt_feed(task_wdt_id);
@@ -541,24 +582,11 @@ static void env_module_thread(void)
 			return;
 		}
 
-		err = zbus_sub_wait_msg(&environmental,
-					&environmental_state.chan,
-					environmental_state.msg_buf,
-					zbus_wait_ms);
-		if (err == -ENOMSG) {
-			continue;
-		} else if (err) {
-			LOG_ERR("zbus_sub_wait_msg, error: %d", err);
-			SEND_FATAL_ERROR();
-			return;
-		}
-
-		err = smf_run_state(SMF_CTX(&environmental_state));
-		if (err) {
-			LOG_ERR("smf_run_state(), error: %d", err);
-			SEND_FATAL_ERROR();
-			return;
-		}
+		/* Environmental data is sampled continuously via sensor triggers and work items.
+		 * Thread only needs to feed watchdog periodically. No zbus messages expected.
+		 * Sleep for 50ms to allow watchdog feeding without blocking the system.
+		 */
+		k_sleep(K_MSEC(50));
 	}
 }
 

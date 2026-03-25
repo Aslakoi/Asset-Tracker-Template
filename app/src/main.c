@@ -515,19 +515,8 @@ static void sensor_triggers_send(void)
 	}
 #endif /* CONFIG_APP_POWER */
 
-#if defined(CONFIG_APP_ENVIRONMENTAL)
-	struct environmental_msg environmental_msg = {
-		.type = ENVIRONMENTAL_SENSOR_SAMPLE_REQUEST,
-	};
-
-	err = zbus_chan_pub(&environmental_chan, &environmental_msg, PUB_TIMEOUT);
-	if (err) {
-		LOG_ERR("Failed to publish environmental sensor sample request, error: %d", err);
-		SEND_FATAL_ERROR();
-
-		return;
-	}
-#endif /* CONFIG_APP_ENVIRONMENTAL */
+/* Environmental module now samples autonomously via interrupts/triggers and writes
+ * directly to the pipe, so no explicit sample request is needed */
 }
 
 static void storage_send_data(struct main_state *state_object)

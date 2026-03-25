@@ -93,3 +93,5 @@ void environmental_extract(const struct environmental_msg *msg,
 	*data = *msg;
 }
 #endif /* CONFIG_APP_ENVIRONMENTAL */
+
+
