@@ -622,7 +622,7 @@ static void handle_data_message(const struct storage_state *state_object,
 	if (bytes_written + type->data_size > max_bytes) {
 		LOG_WRN("Flash full limit reached, stopping program");
 		storage_full = true; 
-	  return;
+		return;
 	}
 
 	err = backend->store(type, (const void *)data, type->data_size);
@@ -631,7 +631,6 @@ static void handle_data_message(const struct storage_state *state_object,
 	}
 
 	bytes_written += type->data_size;
-	LOG_INF("Bytes written: %lu", bytes_written);
 
 	check_and_notify_buffer_threshold(state_object, type);
 }

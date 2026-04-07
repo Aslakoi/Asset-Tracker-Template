@@ -22,7 +22,7 @@
 
 #define ENV_FS 0.1 /* Environmental sensor (BME680) sampling frequency in Hz */
 #define ENV_FS_MS 10000/* Environmental sensor sampling frequency in milliseconds (1000/0.1) */
-#define ENV_SAMPLES_BETWEEN_PUBLISH 50 /* Include environmental data in every Nth IMU message */
+#define ENV_SAMPLES_BETWEEN_PUBLISH FS * 10 /* Include environmental data in every Nth IMU message */
 
 /* Batch message accumulation */
 static struct environmental_msg batch_msg = {
@@ -123,7 +123,7 @@ static K_WORK_DELAYABLE_DEFINE(env_sample_work, env_sample_work_handler);
 
 /* State machine no longer used - environmental is fully asynchronous */
 
-/* Publish accumulated batch message to pipe */
+/* Publish accumulated batch message */
 static void sample_publish_work_handler(struct k_work *work)
 {
 	int err;
@@ -198,7 +198,7 @@ static void sample_collect_work_handler(struct k_work *work)
 
 	idx = batch_msg.sample_count;
 
-	/* Fetch data from BMI270 (accelerometer and gyroscope - high performance) */
+	/* Fetch data from BMI270 (accelerometer and gyroscope) */
 	if (g_bmi270 && device_is_ready(g_bmi270)) {
 		struct sensor_value accel_vals[3] = { 0 };
 		struct sensor_value gyro_vals[3] = { 0 };
@@ -328,7 +328,7 @@ static void sample_collect_work_handler(struct k_work *work)
 	return;
 }
 
-/* Periodic work handler to sample BME680 environmental sensor at 1 Hz */
+/* Periodic work handler to sample BME680 environmental sensor at 0.1 Hz */
 static void env_sample_work_handler(struct k_work *work)
 {
 	int err;
@@ -368,7 +368,7 @@ static void env_sample_work_handler(struct k_work *work)
 		press_d);
 
 reschedule_env:
-	/* Reschedule for next 1 Hz sampling interval */
+	/* Reschedule for next 0.1 Hz sampling interval */
 	k_work_schedule_for_queue(&environmental_workqueue, &env_sample_work, K_MSEC(ENV_FS_MS));
 }
 
@@ -525,7 +525,7 @@ static int sensors_init(const struct device *bmi270, const struct device *adxl36
 		LOG_INF("Interrupt-driven sampling configured (no periodic fallback)");
 	}
 
-	/* Start environmental sensor (BME680) sampling at 1 Hz */
+	/* Start environmental sensor (BME680) sampling at 0.1 Hz */
 	if (bme680 && device_is_ready(bme680)) {
 		err = k_work_schedule_for_queue(&environmental_workqueue, &env_sample_work, K_MSEC(ENV_FS_MS));
 		if (err < 0) {
@@ -539,10 +539,6 @@ static int sensors_init(const struct device *bmi270, const struct device *adxl36
 
 	return 0;
 }
-
-/* Define interrupt handlers*/
-
-
 
 /* Note: On-demand sampling removed.
  * Environmental data is now sampled continuously at 1 Hz via env_sample_work_handler()
@@ -583,8 +579,6 @@ static void env_module_thread(void)
 	k_work_queue_start(&environmental_workqueue, environmental_workqueue_stack,
 			   K_THREAD_STACK_SIZEOF(environmental_workqueue_stack),
 			   13, NULL);
-
-	/* Ring buffer removed - batch message accumulates samples directly */
 
 	/* Initialize sensor triggers and start periodic sampling */
 	err = sensors_init(environmental_state.bmi270, environmental_state.adxl367, environmental_state.bme680);
