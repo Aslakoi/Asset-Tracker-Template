@@ -55,7 +55,6 @@ struct environmental_msg {
 	 *  Store once per batch instead of per-sample to save RAM.
 	 */
 	int32_t pressure;
-	bool pressure_valid;
 
 	/** Timestamp of first sample in batch (milliseconds: unix time or uptime) */
 	uint32_t batch_timestamp_ms;

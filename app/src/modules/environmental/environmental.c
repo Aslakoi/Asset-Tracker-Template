@@ -16,6 +16,7 @@
 #include "app_common.h"
 #include "environmental.h"
 #include "environmental_msgq.h"
+#include "../storage/storage.h"
 
 #define FS 100 /* Sampling frequency in Hz */
 #define FS_MS 1000 / FS /* Sampling frequency in milliseconds (100ms at 10 Hz) */
@@ -30,7 +31,6 @@ static struct environmental_msg batch_msg = {
 	.sample_count = 0,
 	.batch_timestamp_ms = 0,
 	.pressure = 0,
-	.pressure_valid = false,
 };
 static uint8_t imu_sample_count = 0;  /* Counter for IMU samples to include pressure periodically */
 
@@ -107,6 +107,11 @@ static const struct device *g_bme680;
 static void sample_publish_work_handler(struct k_work *work);
 static void sample_collect_work_handler(struct k_work *work);
 static void env_sample_work_handler(struct k_work *work);
+static void startup_delay_work_handler(struct k_work *work);
+static int sensors_init(const struct device *bmi270, const struct device *adxl367, const struct device *bme680);
+
+/* Tracking whether sampling has been started */
+static bool sampling_started = false;
 
 /* Dedicated workqueue for environmental sampling at priority 11.
  * Priority 11 is between storage thread (12) and system workqueue (-1).
@@ -120,6 +125,7 @@ static K_THREAD_STACK_DEFINE(environmental_workqueue_stack, 2048);
 static K_WORK_DELAYABLE_DEFINE(sample_publish_work, sample_publish_work_handler);
 static K_WORK_DELAYABLE_DEFINE(sample_collect_work, sample_collect_work_handler);
 static K_WORK_DELAYABLE_DEFINE(env_sample_work, env_sample_work_handler);
+static K_WORK_DELAYABLE_DEFINE(startup_delay_work, startup_delay_work_handler);
 
 /* State machine no longer used - environmental is fully asynchronous */
 
@@ -135,8 +141,14 @@ static void sample_publish_work_handler(struct k_work *work)
 		return;
 	}
 
-	LOG_INF("Publishing batch with %d samples (msgq, pressure_valid=%d)",
-		batch_msg.sample_count, batch_msg.pressure_valid);
+	if (storage_full) {
+		LOG_DBG("Storage full: skipping batch publish");
+		batch_msg.sample_count = 0;
+		return;
+	}
+
+	LOG_INF("Publishing batch with %d samples (msgq)",
+		batch_msg.sample_count);
 
 	/* Periodic debug print: show all sensor readings from first sample */
 	batch_publish_count++;
@@ -155,18 +167,18 @@ static void sample_publish_work_handler(struct k_work *work)
 		LOG_DBG("  BMI270 Accel: (%.3f, %.3f, %.3f) g", (double)accel_hp_x, (double)accel_hp_y, (double)accel_hp_z);
 		LOG_DBG("  BMI270 Gyro:  (%.2f, %.2f, %.2f) dps", (double)gyro_hp_x, (double)gyro_hp_y, (double)gyro_hp_z);
 		LOG_DBG("  ADXL367 Accel: (%.3f, %.3f, %.3f) g", (double)accel_lp_x, (double)accel_lp_y, (double)accel_lp_z);
-		LOG_DBG("  BME680 Pressure: %d Pa %s", batch_msg.pressure, 
-			batch_msg.pressure_valid ? "(valid)" : "(invalid)");
+		LOG_DBG("  BME680 Pressure: %d Pa", batch_msg.pressure);
 		LOG_DBG("  Timestamp: %u ms, Samples in batch: %u", 
 			batch_msg.batch_timestamp_ms, batch_msg.sample_count);
 		LOG_DBG("=== END SENSOR READINGS ===");
 	}
 
-	/* Use blocking write with 500ms timeout to let storage thread drain the queue.
-	 * Do NOT retry aggressively (1ms loops starve the storage thread).
-	 * Increased timeout to accommodate LittleFS flash write latency (50-200ms).
-	 * Send batch_msg directly without stack copy (RAM optimization).
-	 */
+	/* Non-blocking write to environmental msgq.
+	* If queue is full (128 slots), drop the batch as backpressure signal.
+	* In practice, queue provides ~12+ seconds of buffering at 10 Hz sampling,
+	* so occasional slow flash writes (50-200ms) are absorbed without loss.
+	* Queue only fills if storage thread is blocked for >2 seconds.
+	*/
 	err = environmental_msgq_write(&batch_msg, K_NO_WAIT);
 	if (err) {
 		LOG_WRN("environmental_msgq_write failed: %d (msgq full or timeout)", err);
@@ -178,8 +190,6 @@ static void sample_publish_work_handler(struct k_work *work)
 
 	/* Reset batch message for next batch only after successful write */
 	batch_msg.sample_count = 0;
-	batch_msg.pressure_valid = false;
-	batch_msg.sample_count = 0;
 }
 
 /* Periodic work handler to sample sensors at x Hz and accumulate into batch message */
@@ -189,6 +199,11 @@ static void sample_collect_work_handler(struct k_work *work)
 	uint8_t idx;  /* Index into batch arrays */
 
 	ARG_UNUSED(work);
+
+	if (storage_full) {
+		LOG_DBG("sample_collect_work_handler: storage full, stopping IMU collection");
+		return;
+	}
 
 	/* If batch is full, don't collect more samples until it's published */
 	if (batch_msg.sample_count >= SAMPLES_PER_BATCH) {
@@ -310,7 +325,6 @@ static void sample_collect_work_handler(struct k_work *work)
 	imu_sample_count++;
 	if (imu_sample_count >= ENV_SAMPLES_BETWEEN_PUBLISH && batch_msg.sample_count == 0) {
 		batch_msg.pressure = latest_pressure_pa;
-		batch_msg.pressure_valid = true;
 		imu_sample_count = 0;
 		LOG_DBG("Batch pressure updated: %d Pa", batch_msg.pressure);
 	}
@@ -335,6 +349,11 @@ static void env_sample_work_handler(struct k_work *work)
 	struct sensor_value press = { 0 };
 
 	ARG_UNUSED(work);
+
+	if (storage_full) {
+		LOG_DBG("env_sample_work_handler: storage full, stopping environmental sampling");
+		return;
+	}
 
 	LOG_DBG("env_sample_work_handler: starting BME680 pressure sample");
 
@@ -384,6 +403,29 @@ static void sensor_trigger_callback(const struct device *sensor, const struct se
 	 * Use dedicated environmental workqueue at priority 11 to prevent starvation of storage thread.
 	 */
 	k_work_schedule_for_queue(&environmental_workqueue, &sample_collect_work, K_NO_WAIT);
+}
+
+/* Startup delay work handler - called after delay to begin sampling */
+static void startup_delay_work_handler(struct k_work *work)
+{
+	int err;
+
+	ARG_UNUSED(work);
+
+	if (sampling_started) {
+		LOG_WRN("Sampling already started, skipping duplicate startup");
+		return;
+	}
+
+	LOG_INF("Startup delay complete, beginning environmental sampling");
+
+	err = sensors_init(g_bmi270, g_adxl367, g_bme680);
+	if (err) {
+		LOG_ERR("sensors_init failed: %d", err);
+		SEND_FATAL_ERROR();
+	}
+
+	sampling_started = true;
 }
 
 /* Initialize sensor triggers and start periodic sampling */
@@ -580,10 +622,21 @@ static void env_module_thread(void)
 			   K_THREAD_STACK_SIZEOF(environmental_workqueue_stack),
 			   13, NULL);
 
-	/* Initialize sensor triggers and start periodic sampling */
-	err = sensors_init(environmental_state.bmi270, environmental_state.adxl367, environmental_state.bme680);
-	if (err) {
-		LOG_ERR("sensors_init, error: %d", err);
+	/* Store sensor device pointers globally for work handlers */
+	g_bmi270 = environmental_state.bmi270;
+	g_adxl367 = environmental_state.adxl367;
+	g_bme680 = environmental_state.bme680;
+
+	/* Schedule sensor initialization and sampling start with configured delay */
+	uint32_t startup_delay_ms = CONFIG_APP_ENVIRONMENTAL_STARTUP_DELAY_SECONDS * MSEC_PER_SEC;
+	if (startup_delay_ms > 0) {
+		LOG_INF("Environmental sampling delayed by %u seconds", 
+			CONFIG_APP_ENVIRONMENTAL_STARTUP_DELAY_SECONDS);
+	}
+
+	err = k_work_schedule_for_queue(&environmental_workqueue, &startup_delay_work, K_MSEC(startup_delay_ms));
+	if (err < 0) {
+		LOG_ERR("Failed to schedule startup delay work: %d", err);
 		SEND_FATAL_ERROR();
 		return;
 	}

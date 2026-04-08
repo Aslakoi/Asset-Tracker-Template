@@ -23,7 +23,7 @@ int cloud_environmental_send(const struct environmental_msg *env,
 	}
 
 	/* Extract pressure if available (stored as int32_t Pa) */
-	if (env->pressure_valid && env->pressure != 0) {
+	if (env->pressure != 0) {
 		err = nrf_cloud_coap_sensor_send(NRF_CLOUD_JSON_APPID_VAL_AIR_PRESS,
 						 (double)env->pressure,
 						 timestamp_ms,
