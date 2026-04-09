@@ -47,22 +47,28 @@ LOG_MODULE_REGISTER(environmental, CONFIG_APP_ENVIRONMENTAL_LOG_LEVEL);
 /* LED indicator colors - sent via zbus led_chan */
 static const struct led_msg led_purple = {
 	.type = LED_RGB_SET,
-	.red = 128, .green = 0, .blue = 128,    /* Purple: waiting for startup */
-	.duration_on_msec = 1000, .duration_off_msec = 1000,
+	.red = 64, 
+	.green = 0, 
+	.blue = 64,    /* Purple: waiting for startup */
+	.duration_on_msec = 500, .duration_off_msec = 2000,
 	.repetitions = -1  /* Infinite blinking */
 };
 
 static const struct led_msg led_red = {
 	.type = LED_RGB_SET,
-	.red = 255, .green = 0, .blue = 0,      /* Red: sampling in progress */
-	.duration_on_msec = 1000, .duration_off_msec = 1000,
+	.red = 128, 
+	.green = 0, 
+	.blue = 0,      /* Red: sampling in progress */
+	.duration_on_msec = 500, .duration_off_msec = 2000,
 	.repetitions = -1
 };
 
 static const struct led_msg led_green = {
 	.type = LED_RGB_SET,
-	.red = 0, .green = 255, .blue = 0,      /* Green: storage full */
-	.duration_on_msec = 1000, .duration_off_msec = 1000,
+	.red = 0, 
+	.green = 128, 
+	.blue = 0,      /* Green: storage full */
+	.duration_on_msec = 500, .duration_off_msec = 2000,
 	.repetitions = -1
 };
 

@@ -41,8 +41,10 @@ LOG_MODULE_REGISTER(storage, CONFIG_APP_STORAGE_LOG_LEVEL);
 /* LED indicator for storage full state */
 static const struct led_msg led_green = {
 	.type = LED_RGB_SET,
-	.red = 0, .green = 255, .blue = 0,      /* Green: storage full, ready for upload */
-	.duration_on_msec = 1000, .duration_off_msec = 1000,
+	.red = 0, 
+	.green = 255, 
+	.blue = 0,      /* Green: storage full, ready for upload */
+	.duration_on_msec = 500, .duration_off_msec = 2000,
 	.repetitions = -1  /* Infinite blinking */
 };
 
