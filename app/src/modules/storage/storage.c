@@ -143,6 +143,8 @@ static void state_buffer_pipe_active_entry(void *o);
 static enum smf_state_result state_buffer_pipe_active_run(void *o);
 static void state_buffer_pipe_active_exit(void *o);
 
+static void storage_led_update_work_handler(struct k_work *work);
+
 /*Tracking number of bytes written to flash*/
 static size_t bytes_written = 0;
 bool storage_full = false;
@@ -150,6 +152,9 @@ bool storage_full = false;
    0x180000: Roughly 6% of above value, for debugging
    0x26660: Roughly 1.5% of above value, for debugging */
 static size_t max_bytes = 0x26660; //Roughly 10% margin (LittleFS has overhead)
+
+/* Work item for periodic LED updates when storage is full */
+static K_WORK_DELAYABLE_DEFINE(storage_led_update_work, storage_led_update_work_handler);
 
 
 /* Environmental dedicated fast-path storage.
@@ -240,6 +245,24 @@ static const struct smf_state states[] = {
 };
 
 /* Static helper functions */
+
+/* Periodic LED update handler for storage full state */
+static void storage_led_update_work_handler(struct k_work *work)
+{
+	ARG_UNUSED(work);
+
+	if (!storage_full) {
+		/* Storage no longer full - stop LED updates */
+		return;
+	}
+
+	/* Resend green LED to override any transient messages from main */
+	send_led_message(&led_green);
+
+	/* Reschedule for next update (every 5 seconds) */
+	k_work_schedule(&storage_led_update_work, K_SECONDS(5));
+}
+
 static void task_wdt_callback(int channel_id, void *user_data)
 {
 	LOG_ERR("Watchdog expired, Channel: %d, Thread: %s",
@@ -637,6 +660,7 @@ static int handle_environmental_direct(struct storage_state *state_object)
 			if (!storage_full) {
 				storage_full = true;
 				send_led_message(&led_green);
+				k_work_schedule(&storage_led_update_work, K_SECONDS(5));
 			}
 			return -ENOSPC;
 		}
@@ -685,6 +709,7 @@ static void handle_data_message(const struct storage_state *state_object,
 		if (!storage_full) {
 			storage_full = true;
 			send_led_message(&led_green);
+			k_work_schedule(&storage_led_update_work, K_SECONDS(5));
 		}
 		return;
 	}
@@ -1400,6 +1425,7 @@ while (true) {
 			if (!storage_full) {
 				storage_full = true;
 				send_led_message(&led_green);
+				k_work_schedule(&storage_led_update_work, K_SECONDS(5));
 			}
 		} else {
 			/* Other errors are fatal */
