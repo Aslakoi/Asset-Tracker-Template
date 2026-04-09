@@ -142,10 +142,14 @@ static void sample_publish_work_handler(struct k_work *work);
 static void sample_collect_work_handler(struct k_work *work);
 static void env_sample_work_handler(struct k_work *work);
 static void startup_delay_work_handler(struct k_work *work);
+static void led_update_work_handler(struct k_work *work);
 static int sensors_init(const struct device *bmi270, const struct device *adxl367, const struct device *bme680);
 
 /* Tracking whether sampling has been started */
 static bool sampling_started = false;
+
+/* Track current LED color for periodic updates */
+static const struct led_msg *current_led = NULL;
 
 /* Dedicated workqueue for environmental sampling at priority 11.
  * Priority 11 is between storage thread (12) and system workqueue (-1).
@@ -160,6 +164,7 @@ static K_WORK_DELAYABLE_DEFINE(sample_publish_work, sample_publish_work_handler)
 static K_WORK_DELAYABLE_DEFINE(sample_collect_work, sample_collect_work_handler);
 static K_WORK_DELAYABLE_DEFINE(env_sample_work, env_sample_work_handler);
 static K_WORK_DELAYABLE_DEFINE(startup_delay_work, startup_delay_work_handler);
+static K_WORK_DELAYABLE_DEFINE(led_update_work, led_update_work_handler);
 
 /* State machine no longer used - environmental is fully asynchronous */
 
@@ -439,6 +444,25 @@ static void sensor_trigger_callback(const struct device *sensor, const struct se
 	k_work_schedule_for_queue(&environmental_workqueue, &sample_collect_work, K_NO_WAIT);
 }
 
+/* Periodic LED update handler - resends LED message to keep pattern active */
+static void led_update_work_handler(struct k_work *work)
+{
+	ARG_UNUSED(work);
+
+	if (storage_full) {
+		/* Storage full - stop LED updates */
+		return;
+	}
+
+	/* Resend current LED message to override any transient messages from main */
+	if (current_led) {
+		send_led_message(current_led);
+	}
+
+	/* Reschedule for next update (every 5 seconds) */
+	k_work_schedule_for_queue(&environmental_workqueue, &led_update_work, K_SECONDS(15));
+}
+
 /* Startup delay work handler - called after delay to begin sampling */
 static void startup_delay_work_handler(struct k_work *work)
 {
@@ -462,7 +486,11 @@ static void startup_delay_work_handler(struct k_work *work)
 	sampling_started = true;
 
 	/* Indicate sampling is now active with red LED */
+	current_led = &led_red;
 	send_led_message(&led_red);
+
+	/* Start periodic LED update to keep pattern active (every 5 seconds) */
+	k_work_schedule_for_queue(&environmental_workqueue, &led_update_work, K_SECONDS(15));
 }
 
 /* Initialize sensor triggers and start periodic sampling */
@@ -671,9 +699,23 @@ static void env_module_thread(void)
 	if (startup_delay_ms > 0) {
 		LOG_INF("Environmental sampling delayed by %u seconds", 
 			CONFIG_APP_ENVIRONMENTAL_STARTUP_DELAY_SECONDS);
+		current_led = &led_purple;
 		send_led_message(&led_purple);
+		/* Start periodic updates to keep purple LED active during wait */
+		err = k_work_schedule_for_queue(&environmental_workqueue, &led_update_work, K_SECONDS(15));
+		if (err < 0) {
+			LOG_WRN("Failed to schedule LED update work: %d", err);
+			return;
+		}
 	} else {
+		current_led = &led_red;
 		send_led_message(&led_red);
+		/* Start periodic updates to keep red LED active during sampling */
+		err = k_work_schedule_for_queue(&environmental_workqueue, &led_update_work, K_SECONDS(15));
+		if (err < 0) {
+			LOG_WRN("Failed to schedule LED update work: %d", err);
+			return;
+		}
 	}
 
 	err = k_work_schedule_for_queue(&environmental_workqueue, &startup_delay_work, K_MSEC(startup_delay_ms));
