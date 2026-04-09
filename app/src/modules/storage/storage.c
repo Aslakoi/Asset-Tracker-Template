@@ -30,12 +30,32 @@
 #ifdef CONFIG_APP_LOCATION
 #include "location.h"
 #endif
+#include "../led/led.h"
 
 /* Register log module */
 LOG_MODULE_REGISTER(storage, CONFIG_APP_STORAGE_LOG_LEVEL);
 
 /* Timeout for batch session activity (to prevent stuck sessions) */
 #define STORAGE_SESSION_TIMEOUT_SECONDS		CONFIG_APP_STORAGE_SESSION_TIMEOUT_SECONDS
+
+/* LED indicator for storage full state */
+static const struct led_msg led_green = {
+	.type = LED_RGB_SET,
+	.red = 0, .green = 255, .blue = 0,      /* Green: storage full, ready for upload */
+	.duration_on_msec = 1000, .duration_off_msec = 1000,
+	.repetitions = -1  /* Infinite blinking */
+};
+
+/* Helper function to send LED messages via zbus */
+static int send_led_message(const struct led_msg *led_msg)
+{
+	int err = zbus_chan_pub(&led_chan, led_msg, K_MSEC(100));
+	if (err) {
+		LOG_WRN("Failed to publish LED message: %d", err);
+		return err;
+	}
+	return 0;
+}
 
 /* Register zbus subscriber */
 ZBUS_MSG_SUBSCRIBER_DEFINE(storage_subscriber);
@@ -614,7 +634,10 @@ static int handle_environmental_direct(struct storage_state *state_object)
 
 		if (bytes_written + sizeof(msgs[msg_count]) > max_bytes) {
 			LOG_WRN("Flash full limit reached, stopping handle_environmental_direct");
-			storage_full = true;
+			if (!storage_full) {
+				storage_full = true;
+				send_led_message(&led_green);
+			}
 			return -ENOSPC;
 		}
 
@@ -659,7 +682,10 @@ static void handle_data_message(const struct storage_state *state_object,
 
 	if (bytes_written + type->data_size > max_bytes) {
 		LOG_WRN("Flash full limit reached, stopping program");
-		storage_full = true; 
+		if (!storage_full) {
+			storage_full = true;
+			send_led_message(&led_green);
+		}
 		return;
 	}
 
@@ -1371,7 +1397,10 @@ while (true) {
 		if (drained == -ENOSPC || storage_full) {
 			/* Flash is full - graceful stop, not fatal */
 			LOG_WRN("Storage full: environmental writes halted (Flash at capacity)");
-			storage_full = true;
+			if (!storage_full) {
+				storage_full = true;
+				send_led_message(&led_green);
+			}
 		} else {
 			/* Other errors are fatal */
 			LOG_ERR("handle_environmental_direct failed: %d", drained);

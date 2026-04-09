@@ -17,6 +17,7 @@
 #include "environmental.h"
 #include "environmental_msgq.h"
 #include "../storage/storage.h"
+#include "../led/led.h"
 
 #define FS 100 /* Sampling frequency in Hz */
 #define FS_MS 1000 / FS /* Sampling frequency in milliseconds (100ms at 10 Hz) */
@@ -42,6 +43,39 @@ static uint32_t batch_publish_count = 0;
 #define DEBUG_PRINT_INTERVAL 10  /* Print detailed sensor data every N batches */
 
 LOG_MODULE_REGISTER(environmental, CONFIG_APP_ENVIRONMENTAL_LOG_LEVEL);
+
+/* LED indicator colors - sent via zbus led_chan */
+static const struct led_msg led_purple = {
+	.type = LED_RGB_SET,
+	.red = 128, .green = 0, .blue = 128,    /* Purple: waiting for startup */
+	.duration_on_msec = 1000, .duration_off_msec = 1000,
+	.repetitions = -1  /* Infinite blinking */
+};
+
+static const struct led_msg led_red = {
+	.type = LED_RGB_SET,
+	.red = 255, .green = 0, .blue = 0,      /* Red: sampling in progress */
+	.duration_on_msec = 1000, .duration_off_msec = 1000,
+	.repetitions = -1
+};
+
+static const struct led_msg led_green = {
+	.type = LED_RGB_SET,
+	.red = 0, .green = 255, .blue = 0,      /* Green: storage full */
+	.duration_on_msec = 1000, .duration_off_msec = 1000,
+	.repetitions = -1
+};
+
+/* Helper function to send LED messages via zbus */
+static int send_led_message(const struct led_msg *led_msg)
+{
+	int err = zbus_chan_pub(&led_chan, led_msg, K_MSEC(100));
+	if (err) {
+		LOG_WRN("Failed to publish LED message: %d", err);
+		return err;
+	}
+	return 0;
+}
 
 /* Environmental data now flows via message queue (environmental_msgq.h) only,not zbus.
  * Channel definition below is only for storage_data structure compatibility.
@@ -426,6 +460,9 @@ static void startup_delay_work_handler(struct k_work *work)
 	}
 
 	sampling_started = true;
+
+	/* Indicate sampling is now active with red LED */
+	send_led_message(&led_red);
 }
 
 /* Initialize sensor triggers and start periodic sampling */
@@ -629,9 +666,14 @@ static void env_module_thread(void)
 
 	/* Schedule sensor initialization and sampling start with configured delay */
 	uint32_t startup_delay_ms = CONFIG_APP_ENVIRONMENTAL_STARTUP_DELAY_SECONDS * MSEC_PER_SEC;
+	
+	/* Indicate LED status: purple if waiting for startup delay, red if starting immediately */
 	if (startup_delay_ms > 0) {
 		LOG_INF("Environmental sampling delayed by %u seconds", 
 			CONFIG_APP_ENVIRONMENTAL_STARTUP_DELAY_SECONDS);
+		send_led_message(&led_purple);
+	} else {
+		send_led_message(&led_red);
 	}
 
 	err = k_work_schedule_for_queue(&environmental_workqueue, &startup_delay_work, K_MSEC(startup_delay_ms));

@@ -418,8 +418,12 @@ static void sampling_begin_common(struct main_state *state_object,
 		return;
 	}
 
-#if defined(CONFIG_APP_LED)
+	// LED control now handled by environmental and storage modules
+	// (purple: waiting, red: sampling, green: storage full)
+	// Commented out to avoid overriding module-controlled LEDs
+//#if defined(CONFIG_APP_LED)
 	/* Blue pattern to indicate sampling */
+	/*
 	struct led_msg led_msg = {
 		.type = LED_RGB_SET,
 		.red = 0,
@@ -436,8 +440,9 @@ static void sampling_begin_common(struct main_state *state_object,
 		SEND_FATAL_ERROR();
 
 		return;
-	}
-#endif /* CONFIG_APP_LED */
+	} */
+//#endif /* CONFIG_APP_LED */
+
 
 	state_object->sample_start_time = k_uptime_seconds();
 
