@@ -18,35 +18,24 @@ int cloud_environmental_send(const struct environmental_msg *env,
 {
 	int err;
 
-	err = nrf_cloud_coap_sensor_send(NRF_CLOUD_JSON_APPID_VAL_TEMP,
-					 env->temperature,
-					 timestamp_ms,
-					 confirmable);
-	if (err) {
-		LOG_ERR("Failed to send temperature data to cloud, error: %d", err);
-		return err;
+	if (!env || env->sample_count == 0) {
+		return 0; /* Nothing to send */
 	}
 
-	err = nrf_cloud_coap_sensor_send(NRF_CLOUD_JSON_APPID_VAL_AIR_PRESS,
-					 env->pressure,
-					 timestamp_ms,
-					 confirmable);
-	if (err) {
-		LOG_ERR("Failed to send pressure data to cloud, error: %d", err);
-		return err;
-	}
+	/* Extract pressure if available (stored as int32_t Pa) */
+	if (env->pressure != 0) {
+		err = nrf_cloud_coap_sensor_send(NRF_CLOUD_JSON_APPID_VAL_AIR_PRESS,
+						 (double)env->pressure,
+						 timestamp_ms,
+						 confirmable);
+		if (err) {
+			LOG_ERR("Failed to send pressure data to cloud, error: %d", err);
+			return err;
+		}
 
-	err = nrf_cloud_coap_sensor_send(NRF_CLOUD_JSON_APPID_VAL_HUMID,
-					 env->humidity,
-					 timestamp_ms,
-					 confirmable);
-	if (err) {
-		LOG_ERR("Failed to send humidity data to cloud, error: %d", err);
-		return err;
+		LOG_DBG("Environmental pressure data sent to cloud: P=%.1f Pa", 
+			(double)env->pressure);
 	}
-
-	LOG_DBG("Environmental data sent to cloud: T=%.1f°C, P=%.1fhPa, H=%.1f%%",
-		(double)env->temperature, (double)env->pressure, (double)env->humidity);
 
 	return 0;
 }

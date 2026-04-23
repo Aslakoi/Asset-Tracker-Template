@@ -14,8 +14,12 @@
 extern "C" {
 #endif
 
+#define SAMPLES_PER_BATCH 10  /* Publish every x samples to batch and reduce messaging load */
 
-/* Channels provided by this module */
+
+/* Environmental data flows via dedicated message queue (environmental_msgq.h) 
+ * with no zbus pub/sub. Channel below is only for storage_data compatibility.
+ */
 ZBUS_CHAN_DECLARE(
 	environmental_chan
 );
@@ -36,34 +40,41 @@ enum environmental_msg_type {
 	ENVIRONMENTAL_SENSOR_SAMPLE_REQUEST,
 };
 
+/* Fixed-point scaling: store float as int by multiplying by scale factor */
+#define ACCEL_SCALE 1000        /* ±16g range at 0.001 g/LSB */
+#define GYRO_SCALE 100          /* ±2000 dps range at 0.01 dps/LSB */
+#define PRESSURE_SCALE 1        /* Pa as int32_t */
+
 struct environmental_msg {
+
 	enum environmental_msg_type type;
 
-	/** Contains the current temperature in celsius. */
-	uint16_t temperature;
+	/** Timestamp of first sample in batch (milliseconds: unix time or uptime) */
+	uint32_t batch_timestamp_ms;
 
-	/** Contains the current humidity in percentage. */
-	uint16_t humidity;
+	/** Per-sample time deltas from batch_timestamp_ms in milliseconds (assuming ~100 Hz = ~10 ms apart) */
+	uint16_t timestamp_delta_ms[SAMPLES_PER_BATCH];
 
-	/** Contains the current pressure in Pa. */
-	uint16_t pressure;
+	/** Latest pressure value in fixed-point Pa (int32_t) */
+	int32_t pressure;	
 
-	/** Contains the current acceleration values in g. */
-	float accel_hp[3];
-
-	/** Contains the current gyroscope values in dps. */
-	float gyro_hp[3];
-
-	/** Contains the current low-power acceleration values in g. */
-	float accel_lp[3];
-
-	/** Timestamp when the sample was taken in milliseconds.
-	 *  This is either:
-	 * - Unix time in milliseconds if the system clock was synchronized at sampling time, or
-	 * - Uptime in milliseconds if the system clock was not synchronized at sampling time.
-	 * Only valid for ENVIRONMENTAL_SENSOR_SAMPLE_RESPONSE events.
+	/** Contains the current acceleration values in fixed-point (value * 1000 = g).
+	 *  Fixed-point int16_t: range ±32.767g, resolution 0.001g
 	 */
-	int64_t timestamp;
+	int16_t accel_hp[3][SAMPLES_PER_BATCH];
+
+	/** Contains the current gyroscope values in fixed-point (value * 100 = dps).
+	 *  Fixed-point int16_t: range ±327.67 dps, resolution 0.01 dps
+	 */
+	int16_t gyro_hp[3][SAMPLES_PER_BATCH];
+
+	/** Contains the current low-power acceleration values in fixed-point (value * 1000 = g).
+	 *  Fixed-point int16_t: range ±32.767g, resolution 0.001g
+	 */
+	int16_t accel_lp[3][SAMPLES_PER_BATCH];
+
+	/** Number of samples currently in this batch message (0 to SAMPLES_PER_BATCH) */
+	uint8_t sample_count;
 };
 
 #define MSG_TO_ENVIRONMENTAL_MSG(_msg)	(*(const struct environmental_msg *)_msg)

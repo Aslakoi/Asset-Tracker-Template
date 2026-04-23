@@ -63,6 +63,15 @@ config APP_ENVIRONMENTAL_RING_BUFFER_SIZE
 	  
 	  Larger buffers reduce sample loss at the cost of more memory usage.
 
+config APP_ENVIRONMENTAL_STARTUP_DELAY_SECONDS
+	int "Startup delay before sampling begins (seconds)"
+	default 0
+	help
+	  Delay in seconds before the environmental module starts collecting sensor data.
+	  Set to 0 for immediate start (default).
+	  Use this to stagger multiple devices so they start sampling at different times.
+	  Example: Set device A to 0, device B to 24 hours, so device B starts when device A fills up storage.
+
 module = APP_ENVIRONMENTAL
 module-str = ENVIRONMENTAL
 source "subsys/logging/Kconfig.template.log_config"

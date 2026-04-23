@@ -17,22 +17,47 @@
 #include "storage_backend.h"
 #include "storage_data_types.h"
 #include "app_common.h"
+#include <zephyr/fs/fs.h>
+#include <zephyr/fs/littlefs.h>
 
 #ifdef CONFIG_APP_POWER
 #include "power.h"
 #endif
 #ifdef CONFIG_APP_ENVIRONMENTAL
 #include "environmental.h"
+#include "environmental_msgq.h"
 #endif
 #ifdef CONFIG_APP_LOCATION
 #include "location.h"
 #endif
+#include "../led/led.h"
 
 /* Register log module */
 LOG_MODULE_REGISTER(storage, CONFIG_APP_STORAGE_LOG_LEVEL);
 
 /* Timeout for batch session activity (to prevent stuck sessions) */
 #define STORAGE_SESSION_TIMEOUT_SECONDS		CONFIG_APP_STORAGE_SESSION_TIMEOUT_SECONDS
+
+/* LED indicator for storage full state */
+static const struct led_msg led_green = {
+	.type = LED_RGB_SET,
+	.red = 0, 
+	.green = 255, 
+	.blue = 0,      /* Green: storage full, ready for upload */
+	.duration_on_msec = 500, .duration_off_msec = 2000,
+	.repetitions = -1  /* Infinite blinking */
+};
+
+/* Helper function to send LED messages via zbus */
+static int send_led_message(const struct led_msg *led_msg)
+{
+	int err = zbus_chan_pub(&led_chan, led_msg, K_MSEC(100));
+	if (err) {
+		LOG_WRN("Failed to publish LED message: %d", err);
+		return err;
+	}
+	return 0;
+}
 
 /* Register zbus subscriber */
 ZBUS_MSG_SUBSCRIBER_DEFINE(storage_subscriber);
@@ -60,35 +85,6 @@ BUILD_ASSERT(CONFIG_APP_STORAGE_WATCHDOG_TIMEOUT_SECONDS >
 #define MAX_MSG_SIZE	MAX(STORAGE_MAX_MSG_SIZE_FROM_LIST(DATA_SOURCE_LIST), \
 			    sizeof(struct storage_msg))
 
-/**
- * @brief Add storage_subscriber as an observer to a channel
- *
- * This macro is used with DATA_SOURCE_LIST to add storage_subscriber as an observer
- * to each enabled channel. When DATA_SOURCE_LIST(ADD_OBSERVERS) is expanded, it:
- *
- * 1. Takes each enabled entry from DATA_SOURCE_LIST
- * 2. Passes the entry's parameters to this macro
- * 3. Creates a ZBUS_CHAN_ADD_OBS call using just the channel parameter
- *
- * For example, with CONFIG_APP_POWER enabled, the expansion looks like:
- *
- * Step 1: DATA_SOURCE_LIST expands to:
- *   ADD_OBSERVERS(battery, power_chan, struct power_msg, double, battery_check, battery_extract)
- *
- * Step 2: ADD_OBSERVERS expands to:
- *   ZBUS_CHAN_ADD_OBS(power_chan, storage_subscriber, 0)
- *
- * This process repeats for each enabled module in DATA_SOURCE_LIST.
- *
- * @param _n Name of the data type (unused in this macro)
- * @param _chan Channel to add observer to (used to create ZBUS_CHAN_ADD_OBS)
- * @param _t Message type (unused in this macro)
- * @param _dt Data type to store (unused in this macro)
- * @param _c Check function (unused in this macro)
- * @param _e Extract function (unused in this macro)
- */
-#define ADD_OBSERVERS(_n, _chan, _t, _dt, _c, _e) ZBUS_CHAN_ADD_OBS(_chan, storage_subscriber, 0);
-
 /* Private storage channel message types */
 enum priv_storage_msg {
 	STORAGE_BATCH_SESSION_TIMEOUT,
@@ -96,8 +92,21 @@ enum priv_storage_msg {
 
 /* Add storage_subscriber as observer to each enabled channel.
  * The data source list is defined in `storage_data_types.h`.
+ * Environmental channel is excluded since environmental data uses a dedicated pipe.
  */
-DATA_SOURCE_LIST(ADD_OBSERVERS);
+#define ADD_OBSERVERS(_n, _chan, _t, _dt, _c, _e) \
+	ZBUS_CHAN_ADD_OBS(_chan, storage_subscriber, 0);
+
+/* Register observers for power and location channels only.
+ * Environmental channel is not subscribed here since it uses a dedicated pipe.
+ */
+#ifdef CONFIG_APP_POWER
+ZBUS_CHAN_ADD_OBS(power_chan, storage_subscriber, 0);
+#endif /* CONFIG_APP_POWER */
+
+#ifdef CONFIG_APP_LOCATION
+ZBUS_CHAN_ADD_OBS(location_chan, storage_subscriber, 0);
+#endif /* CONFIG_APP_LOCATION */
 
 /* Create the storage channel */
 ZBUS_CHAN_DEFINE(storage_chan,
@@ -136,6 +145,39 @@ static void state_buffer_pipe_active_entry(void *o);
 static enum smf_state_result state_buffer_pipe_active_run(void *o);
 static void state_buffer_pipe_active_exit(void *o);
 
+static void storage_led_update_work_handler(struct k_work *work);
+
+/*Tracking number of bytes written to flash*/
+static size_t bytes_written = 0;
+bool storage_full = false;
+/* 0xF00000: Roughly 60% of above value 
+   0x180000: Roughly 6% of above value, for debugging
+   0x26660: Roughly 1.5% of above value, for debugging */
+static size_t max_bytes = 0x26660; //Roughly 10% margin (LittleFS has overhead)
+
+/* Work item for periodic LED updates when storage is full */
+static K_WORK_DELAYABLE_DEFINE(storage_led_update_work, storage_led_update_work_handler);
+
+
+/* Environmental dedicated fast-path storage.
+ * Drains multiple messages from msgq and writes them in a single filesystem operation.
+ * This bypasses the generic backend's header churn and per-message overhead.
+ */
+#ifdef CONFIG_APP_ENVIRONMENTAL
+#define ENV_STREAM_FILE_PATH "/att_storage/ENVIRONMENTAL_STREAM.bin"
+#define ENV_BULK_WRITE_MAX_RECORDS 8
+#define ENV_SIZE_LOG_INTERVAL 10  /* Log file size every N bulk writes */
+
+struct env_stream_state {
+	bool initialized;
+	uint32_t records_written;
+	size_t file_offset;
+	uint32_t write_count;  /* Counter for periodic size logging */
+};
+
+static struct env_stream_state env_stream;
+#endif /* CONFIG_APP_ENVIRONMENTAL */
+
 /* Storage pipe for streaming data to consumers */
 K_PIPE_DEFINE(storage_pipe, CONFIG_APP_STORAGE_BATCH_BUFFER_SIZE, 4);
 
@@ -172,6 +214,9 @@ struct storage_state {
 
 	/* Buffer threshold limit */
 	uint32_t buffer_threshold_limit;
+
+	/* Track per-type threshold crossing state to prevent repeated notifications */
+	bool threshold_notified[STORAGE_DATA_TYPE_COUNT];
 };
 
 /* Delayable work for session timeout */
@@ -202,6 +247,24 @@ static const struct smf_state states[] = {
 };
 
 /* Static helper functions */
+
+/* Periodic LED update handler for storage full state */
+static void storage_led_update_work_handler(struct k_work *work)
+{
+	ARG_UNUSED(work);
+
+	if (!storage_full) {
+		/* Storage no longer full - stop LED updates */
+		return;
+	}
+
+	/* Resend green LED to override any transient messages from main */
+	send_led_message(&led_green);
+
+	/* Reschedule for next update (every 5 seconds) */
+	k_work_schedule(&storage_led_update_work, K_SECONDS(15));
+}
+
 static void task_wdt_callback(int channel_id, void *user_data)
 {
 	LOG_ERR("Watchdog expired, Channel: %d, Thread: %s",
@@ -314,22 +377,315 @@ static void check_and_notify_buffer_threshold(const struct storage_state *state_
 	}
 
 	if ((uint32_t)count >= state_object->buffer_threshold_limit) {
-		LOG_DBG("Buffer threshold limit reached for %s: count=%d, limit=%u",
-			type->name, count, state_object->buffer_threshold_limit);
+		/* Count is above threshold */
+		if (!state_object->threshold_notified[type->data_type]) {
+			/* Threshold crossed - notify once */
+			LOG_DBG("Buffer threshold limit reached for %s: count=%d, limit=%u",
+				type->name, count, state_object->buffer_threshold_limit);
 
-		struct storage_msg threshold_msg = {
-			.type = STORAGE_THRESHOLD_REACHED,
-			.data_type = type->data_type,
-			.data_len = (uint16_t)count,
-		};
+			struct storage_msg threshold_msg = {
+				.type = STORAGE_THRESHOLD_REACHED,
+				.data_type = type->data_type,
+				.data_len = (uint16_t)count,
+			};
 
-		err = zbus_chan_pub(&storage_chan, &threshold_msg, PUB_TIMEOUT);
-		if (err) {
-			LOG_ERR("Failed to publish buffer threshold message, error: %d", err);
-			SEND_FATAL_ERROR();
+			err = zbus_chan_pub(&storage_chan, &threshold_msg, PUB_TIMEOUT);
+			if (err) {
+				LOG_ERR("Failed to publish buffer threshold message, error: %d", err);
+				SEND_FATAL_ERROR();
+			}
+
+			/* Mark that we've notified for this data type */
+			((struct storage_state *)state_object)->threshold_notified[type->data_type] = true;
 		}
+	} else {
+		/* Count is below threshold - clear the notified flag for next crossing */
+		((struct storage_state *)state_object)->threshold_notified[type->data_type] = false;
 	}
 }
+
+#ifdef CONFIG_APP_ENVIRONMENTAL
+/* Initialize environmental stream state from file.
+ * Loads file size to determine write offset for append operations.
+ */
+static int environmental_stream_init(void)
+{
+	struct fs_dirent entry;
+	int ret;
+
+	if (env_stream.initialized) {
+		return 0;
+	}
+
+	ret = fs_stat(ENV_STREAM_FILE_PATH, &entry);
+	if (ret < 0) {
+		/* File probably does not exist yet; that's fine */
+		env_stream.file_offset = 0;
+		env_stream.records_written = 0;
+		LOG_INF("Environmental stream initialized: new file (not found from previous run)");
+	} else {
+		env_stream.file_offset = entry.size;
+		/* Rough estimate: each record is one environmental_msg */
+		env_stream.records_written = entry.size / sizeof(struct environmental_msg);
+		LOG_INF("Environmental stream initialized: recovered %u records, file size: %zu bytes",
+			env_stream.records_written, entry.size);
+	}
+
+	env_stream.initialized = true;
+	env_stream.write_count = 0;
+	return 0;
+}
+
+/* Log environmental stream file size and statistics */
+static void log_environmental_stream_size(void)
+{
+	struct fs_dirent entry;
+	int ret;
+	uint32_t file_size_kb;
+	uint32_t percent_full;
+
+	ret = fs_stat(ENV_STREAM_FILE_PATH, &entry);
+	if (ret < 0) {
+		LOG_INF("Environmental stream file does not exist yet");
+		return;
+	}
+
+	file_size_kb = entry.size / 1024;
+	percent_full = (bytes_written * 100) / max_bytes;
+
+	LOG_INF("Environmental stream file size: %zu bytes (%u KB), Records: %u, Storage: %u%% full",
+		entry.size, file_size_kb, env_stream.records_written, percent_full);
+}
+
+/* Bulk append environmental messages to the dedicated stream file.
+ * Opens file once, seeks to end, writes all records, closes.
+ * This avoids the per-message overhead of the generic backend.
+ */
+static int environmental_stream_store_bulk(const struct environmental_msg *msgs, size_t count)
+{
+	struct fs_file_t file;
+	int ret;
+	size_t total_size;
+	uint32_t write_start_ms;
+
+	if ((msgs == NULL) || (count == 0) || (count > ENV_BULK_WRITE_MAX_RECORDS)) {
+		return -EINVAL;
+	}
+
+	ret = environmental_stream_init();
+	if (ret) {
+		return ret;
+	}
+
+	total_size = count * sizeof(struct environmental_msg);
+
+	fs_file_t_init(&file);
+
+	write_start_ms = k_uptime_get();
+
+	ret = fs_open(&file, ENV_STREAM_FILE_PATH, FS_O_CREATE | FS_O_RDWR);
+	if (ret < 0) {
+		LOG_ERR("Failed to open %s: %d", ENV_STREAM_FILE_PATH, ret);
+		return ret;
+	}
+
+	ret = fs_seek(&file, env_stream.file_offset, FS_SEEK_SET);
+	if (ret < 0) {
+		LOG_ERR("Failed to seek %s: %d", ENV_STREAM_FILE_PATH, ret);
+		(void)fs_close(&file);
+		return ret;
+	}
+
+	ret = fs_write(&file, msgs, total_size);
+	if (ret < 0) {
+		LOG_ERR("Failed to write environmental stream: %d", ret);
+		(void)fs_close(&file);
+		return ret;
+	}
+
+	if ((size_t)ret != total_size) {
+		LOG_ERR("Short write to environmental stream: %d/%zu", ret, total_size);
+		(void)fs_close(&file);
+		return -EIO;
+	}
+
+	ret = fs_close(&file);
+	if (ret < 0) {
+		LOG_ERR("Failed to close %s: %d", ENV_STREAM_FILE_PATH, ret);
+		return ret;
+	}
+
+	uint32_t write_time_ms = k_uptime_get() - write_start_ms;
+
+	if (write_time_ms > 1000) {
+		LOG_WRN("Slow environmental write: %u ms for %zu records", write_time_ms, count);
+	}
+
+	env_stream.file_offset += total_size;
+	env_stream.records_written += count;
+	bytes_written += total_size;
+
+	/* Periodically log file size */
+	env_stream.write_count++;
+	if (env_stream.write_count >= ENV_SIZE_LOG_INTERVAL) {
+		log_environmental_stream_size();
+		env_stream.write_count = 0;
+	}
+
+	return 0;
+}
+
+/* Read and print environmental data stored in the dedicated stream file.
+ * Displays first 10 records with timestamp, pressure, sample count, and first sample sensor values.
+ */
+static void environmental_stream_debug_print(void)
+{
+	struct fs_file_t file;
+	struct environmental_msg msg;
+	int ret;
+	int record_count = 0;
+	const int MAX_RECORDS_TO_PRINT = 10;
+	int retry_count = 0;
+	const int MAX_RETRIES = 3;
+
+	/* Retry open in case storage thread is accessing file */
+	while (retry_count < MAX_RETRIES) {
+		ret = fs_open(&file, ENV_STREAM_FILE_PATH, FS_O_READ);
+		if (ret == 0) {
+			break;
+		}
+		if (ret != -EBUSY && ret != -EAGAIN) {
+			LOG_INF("Environmental stream file not found or empty (error: %d)", ret);
+			return;
+		}
+		retry_count++;
+		if (retry_count < MAX_RETRIES) {
+			k_msleep(50);
+		}
+	}
+
+	if (ret < 0) {
+		LOG_INF("Failed to open environmental stream file after %d retries (error: %d)", 
+			MAX_RETRIES, ret);
+		return;
+	}
+
+	LOG_INF("=== Environmental Data Storage ===");
+	LOG_INF("Reading up to %d stored records:", MAX_RECORDS_TO_PRINT);
+	LOG_INF("");
+
+	while (record_count < MAX_RECORDS_TO_PRINT) {
+		ret = fs_read(&file, &msg, sizeof(msg));
+
+		if (ret == 0) {
+			/* End of file */
+			break;
+		}
+
+		if (ret < 0) {
+			LOG_ERR("Failed to read environmental stream: %d", ret);
+			break;
+		}
+
+		if ((size_t)ret != sizeof(msg)) {
+			LOG_WRN("Partial read: %d/%zu bytes", ret, sizeof(msg));
+			break;
+		}
+
+		/* Print record summary */
+		LOG_INF("[Record %d]", record_count);
+		LOG_INF("  Timestamp: %u ms, Samples: %u, Pressure: %d Pa",
+			msg.batch_timestamp_ms, msg.sample_count, msg.pressure);
+
+		if (msg.sample_count > 0) {
+			/* Print first sample data */
+			float accel_x = (float)msg.accel_hp[0][0] / ACCEL_SCALE;
+			float accel_y = (float)msg.accel_hp[1][0] / ACCEL_SCALE;
+			float accel_z = (float)msg.accel_hp[2][0] / ACCEL_SCALE;
+			float gyro_x = (float)msg.gyro_hp[0][0] / GYRO_SCALE;
+			float gyro_y = (float)msg.gyro_hp[1][0] / GYRO_SCALE;
+			float gyro_z = (float)msg.gyro_hp[2][0] / GYRO_SCALE;
+
+			LOG_INF("  Sample 0 - Accel: (%.3f, %.3f, %.3f) g, Gyro: (%.2f, %.2f, %.2f) dps",
+				(double)accel_x, (double)accel_y, (double)accel_z, (double)gyro_x, (double)gyro_y, (double)gyro_z);
+		}
+
+		LOG_INF("");
+		record_count++;
+	}
+
+	if (record_count == 0) {
+		LOG_INF("No records found in environmental stream");
+	} else {
+		LOG_INF("Total records displayed: %d", record_count);
+	}
+
+	LOG_INF("=== End of Environmental Data ===");
+
+	(void)fs_close(&file);
+}
+
+/* Public interface for shell commands */
+void storage_env_print(void)
+{
+	environmental_stream_debug_print();
+}
+
+/* Drain multiple environmental messages from the queue and write them in bulk.
+ * This replaces the per-message generic backend path with a single filesystem operation.
+ */
+static int handle_environmental_direct(struct storage_state *state_object)
+{
+	int err;
+	struct environmental_msg msgs[ENV_BULK_WRITE_MAX_RECORDS];
+	size_t msg_count = 0;
+
+	ARG_UNUSED(state_object);
+
+	/* Drain up to ENV_BULK_WRITE_MAX_RECORDS messages from queue */
+	while (msg_count < ENV_BULK_WRITE_MAX_RECORDS) {
+		err = environmental_msgq_read(&msgs[msg_count], K_NO_WAIT);
+		if (err == -ENOMSG) {
+			break;
+		}
+		if (err) {
+			LOG_ERR("Failed to read from environmental msgq: %d", err);
+			return err;
+		}
+
+		if (msgs[msg_count].type != ENVIRONMENTAL_SENSOR_SAMPLE_RESPONSE) {
+			continue;
+		}
+
+		if (bytes_written + sizeof(msgs[msg_count]) > max_bytes) {
+			LOG_WRN("Flash full limit reached, stopping handle_environmental_direct");
+			if (!storage_full) {
+				storage_full = true;
+				send_led_message(&led_green);
+				k_work_schedule(&storage_led_update_work, K_SECONDS(15));
+			}
+			return -ENOSPC;
+		}
+
+		msg_count++;
+	}
+
+	if (msg_count == 0) {
+		return 0;
+	}
+
+	/* Write all drained messages in one operation */
+	err = environmental_stream_store_bulk(msgs, msg_count);
+	if (err) {
+		LOG_ERR("Failed to store %zu environmental messages: %d", msg_count, err);
+		return err;
+	}
+
+	LOG_DBG("Drained and wrote %zu environmental messages", msg_count);
+
+	return (int)msg_count;
+}
+#endif /* CONFIG_APP_ENVIRONMENTAL */
 
 static void handle_data_message(const struct storage_state *state_object,
 				const struct storage_data *type,
@@ -347,10 +703,25 @@ static void handle_data_message(const struct storage_state *state_object,
 
 	type->extract_data(buf, (void *)data);
 
+	LOG_INF("Data size: %zu", type->data_size);
+	LOG_INF("Bytes written: %zu", bytes_written);
+
+	if (bytes_written + type->data_size > max_bytes) {
+		LOG_WRN("Flash full limit reached, stopping program");
+		if (!storage_full) {
+			storage_full = true;
+			send_led_message(&led_green);
+			k_work_schedule(&storage_led_update_work, K_SECONDS(5));
+		}
+		return;
+	}
+
 	err = backend->store(type, (const void *)data, type->data_size);
 	if (err) {
 		LOG_ERR("Failed to store %s data, error: %d", type->name, err);
 	}
+
+	bytes_written += type->data_size;
 
 	check_and_notify_buffer_threshold(state_object, type);
 }
@@ -405,14 +776,49 @@ static void storage_clear(void)
 {
 	int err;
 
-	LOG_DBG("Purging storage");
+	LOG_INF("=== Storage Clear Starting ===");
 
-	/* Clear all stored data */
+	/* Clear all stored data from generic backend */
 	err = storage_backend_get()->clear();
 	if (err) {
 		LOG_ERR("Failed to clear storage backend, error: %d", err);
 		SEND_FATAL_ERROR();
 	}
+	LOG_INF("Generic backend storage cleared successfully");
+
+#ifdef CONFIG_APP_ENVIRONMENTAL
+	/* Clear dedicated environmental stream file */
+	LOG_INF("Clearing environmental stream file at %s...", ENV_STREAM_FILE_PATH);
+	
+	/* Log final file size before deletion */
+	log_environmental_stream_size();
+	
+	/* Check if file exists before trying to delete */
+	struct fs_dirent file_entry;
+	err = fs_stat(ENV_STREAM_FILE_PATH, &file_entry);
+	if (err < 0) {
+		/* File doesn't exist - this is expected */
+		LOG_INF("Environmental stream file doesn't exist");
+	} else {
+		/* File exists, delete it */
+		err = fs_unlink(ENV_STREAM_FILE_PATH);
+		if (err < 0) {
+			LOG_ERR("Failed to delete %s: %d", ENV_STREAM_FILE_PATH, err);
+			SEND_FATAL_ERROR();
+		} else {
+			LOG_INF("Environmental stream file deleted successfully");
+		}
+	}
+
+	env_stream.initialized = false;
+	env_stream.file_offset = 0;
+	env_stream.records_written = 0;
+#endif
+
+	/* Reset capacity tracking */
+	bytes_written = 0;
+	storage_full = false;
+	LOG_INF("=== Storage Clear Complete ===");
 }
 
 static void update_threshold(struct storage_state *state_object, uint32_t new_threshold)
@@ -768,7 +1174,19 @@ static void state_running_entry(void *o)
 		return;
 	}
 
+	/* Initialize threshold notification latch flags */
+	memset(storage_state->threshold_notified, 0, sizeof(storage_state->threshold_notified));
+
 	k_work_init_delayable(&storage_state->session_timeout_work, session_timeout_work_fn);
+
+	/* Clear storage on boot to ensure clean state */
+	LOG_INF("Clearing storage on boot...");
+	storage_clear();
+
+#ifdef CONFIG_APP_ENVIRONMENTAL
+	/* Debug: Read and display stored environmental data */
+	environmental_stream_debug_print();
+#endif /* CONFIG_APP_ENVIRONMENTAL */
 }
 
 static enum smf_state_result state_running_run(void *o)
@@ -964,9 +1382,6 @@ static void storage_thread(void)
 	int err;
 	int task_wdt_id;
 	const uint32_t wdt_timeout_ms = CONFIG_APP_STORAGE_WATCHDOG_TIMEOUT_SECONDS * MSEC_PER_SEC;
-	const uint32_t execution_time_ms =
-		(CONFIG_APP_STORAGE_MSG_PROCESSING_TIMEOUT_SECONDS * MSEC_PER_SEC);
-	const k_timeout_t zbus_wait_ms = K_MSEC(wdt_timeout_ms - execution_time_ms);
 	static struct storage_state storage_state;
 
 	storage_state.buffer_threshold_limit = CONFIG_APP_STORAGE_INITIAL_THRESHOLD;
@@ -993,34 +1408,60 @@ static void storage_thread(void)
 	/* Initialize the state machine */
 	smf_set_initial(SMF_CTX(&storage_state), &states[STATE_RUNNING]);
 
-	while (true) {
-		err = task_wdt_feed(task_wdt_id);
-		if (err) {
-			LOG_ERR("task_wdt_feed, error: %d", err);
-			SEND_FATAL_ERROR();
+while (true) {
+	bool did_work = false;
 
+	err = task_wdt_feed(task_wdt_id);
+	if (err) {
+		LOG_ERR("task_wdt_feed, error: %d", err);
+		SEND_FATAL_ERROR();
+		return;
+	}
+
+#ifdef CONFIG_APP_ENVIRONMENTAL
+	int drained = handle_environmental_direct(&storage_state);
+	if (drained < 0) {
+		if (drained == -ENOSPC || storage_full) {
+			/* Flash is full - graceful stop, not fatal */
+			LOG_WRN("Storage full: environmental writes halted (Flash at capacity)");
+			if (!storage_full) {
+				storage_full = true;
+				send_led_message(&led_green);
+				k_work_schedule(&storage_led_update_work, K_SECONDS(15));
+			}
+		} else {
+			/* Other errors are fatal */
+			LOG_ERR("handle_environmental_direct failed: %d", drained);
+			SEND_FATAL_ERROR();
 			return;
 		}
+	}
+	if (drained > 0) {
+		did_work = true;
+	}
+#endif
 
-		err = zbus_sub_wait_msg(&storage_subscriber, &storage_state.chan,
-				       storage_state.msg_buf, zbus_wait_ms);
-		if (err == -ENOMSG) {
-			continue;
-		} else if (err) {
-			LOG_ERR("zbus_sub_wait_msg, error: %d", err);
-			SEND_FATAL_ERROR();
-
-			return;
-		}
+	err = zbus_sub_wait_msg(&storage_subscriber, &storage_state.chan,
+				storage_state.msg_buf, K_NO_WAIT);
+	if (err == 0) {
+		did_work = true;
 
 		err = smf_run_state(SMF_CTX(&storage_state));
 		if (err) {
 			LOG_ERR("smf_run_state(), error: %d", err);
 			SEND_FATAL_ERROR();
-
 			return;
 		}
+	} else if (err != -ENOMSG) {
+		LOG_ERR("zbus_sub_wait_msg, error: %d", err);
+		SEND_FATAL_ERROR();
+		return;
 	}
+
+	if (!did_work) {
+		k_sleep(K_MSEC(5));
+	}
+}
 }
 
 K_THREAD_DEFINE(storage_thread_id,

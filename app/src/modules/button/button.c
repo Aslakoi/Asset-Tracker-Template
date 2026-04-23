@@ -44,7 +44,7 @@ static void long_press_work_handler(struct k_work *work)
 
 	/* Check if button is still pressed */
 	if (button_state.pressed_buttons & DK_BTN1_MSK) {
-		LOG_DBG("Button 1 long press detected!");
+		LOG_INF("Button 1 long press detected!");
 
 		msg.button_number = 1;
 		msg.type = BUTTON_PRESS_LONG;
@@ -66,7 +66,7 @@ static void publish_short_press(uint8_t button_number)
 	msg.button_number = button_number;
 	msg.type = BUTTON_PRESS_SHORT;
 
-	LOG_DBG("Button %d short press", button_number);
+	LOG_INF("Button %d short press", button_number);
 
 	err = zbus_chan_pub(&button_chan, &msg, PUB_TIMEOUT);
 	if (err) {

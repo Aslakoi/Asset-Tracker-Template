@@ -40,8 +40,8 @@ if APP_STORAGE_BACKEND_LITTLEFS
 
 # Setup PM partition size for LittleFS to 64KB by default
 config PM_PARTITION_SIZE_LITTLEFS
-	default 0x10000
-
+  default 0x1000000
+  
 config PM_PARTITION_REGION_LITTLEFS_EXTERNAL
 	default y if PM_EXTERNAL_FLASH_ENABLED
 

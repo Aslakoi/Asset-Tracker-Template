@@ -418,8 +418,12 @@ static void sampling_begin_common(struct main_state *state_object,
 		return;
 	}
 
-#if defined(CONFIG_APP_LED)
+	// LED control now handled by environmental and storage modules
+	// (purple: waiting, red: sampling, green: storage full)
+	// Commented out to avoid overriding module-controlled LEDs
+//#if defined(CONFIG_APP_LED)
 	/* Blue pattern to indicate sampling */
+	/*
 	struct led_msg led_msg = {
 		.type = LED_RGB_SET,
 		.red = 0,
@@ -436,8 +440,9 @@ static void sampling_begin_common(struct main_state *state_object,
 		SEND_FATAL_ERROR();
 
 		return;
-	}
-#endif /* CONFIG_APP_LED */
+	} */
+//#endif /* CONFIG_APP_LED */
+
 
 	state_object->sample_start_time = k_uptime_seconds();
 
@@ -515,19 +520,8 @@ static void sensor_triggers_send(void)
 	}
 #endif /* CONFIG_APP_POWER */
 
-#if defined(CONFIG_APP_ENVIRONMENTAL)
-	struct environmental_msg environmental_msg = {
-		.type = ENVIRONMENTAL_SENSOR_SAMPLE_REQUEST,
-	};
-
-	err = zbus_chan_pub(&environmental_chan, &environmental_msg, PUB_TIMEOUT);
-	if (err) {
-		LOG_ERR("Failed to publish environmental sensor sample request, error: %d", err);
-		SEND_FATAL_ERROR();
-
-		return;
-	}
-#endif /* CONFIG_APP_ENVIRONMENTAL */
+/* Environmental module now samples autonomously via interrupts/triggers and writes
+ * directly to the pipe, so no explicit sample request is needed */
 }
 
 static void storage_send_data(struct main_state *state_object)
@@ -1677,6 +1671,11 @@ int main(void)
 	smf_set_initial(SMF_CTX(&main_state), &states[STATE_RUNNING]);
 
 	while (1) {
+		//if (storage_full){
+		//	LOG_WRN("Storage full");
+		//	return -1;
+		//}
+
 		err = task_wdt_feed(task_wdt_id);
 		if (err) {
 			LOG_ERR("task_wdt_feed, error: %d", err);

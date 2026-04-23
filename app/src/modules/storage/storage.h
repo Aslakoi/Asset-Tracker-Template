@@ -16,6 +16,9 @@
 extern "C" {
 #endif
 
+/*Flag for full storage*/
+extern bool storage_full;
+
 /* Message types for the storage channels */
 enum storage_msg_type {
 	/* Input messages */
@@ -165,6 +168,9 @@ int storage_batch_read(struct storage_data_item *out_item,
 /* Declare the storage channels */
 ZBUS_CHAN_DECLARE(storage_chan);
 ZBUS_CHAN_DECLARE(storage_data_chan);
+
+/* Debug interface: Print stored environmental data (shell command) */
+void storage_env_print(void);
 
 #ifdef __cplusplus
 }
