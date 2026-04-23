@@ -46,21 +46,17 @@ enum environmental_msg_type {
 #define PRESSURE_SCALE 1        /* Pa as int32_t */
 
 struct environmental_msg {
+
 	enum environmental_msg_type type;
-
-	/** Number of samples currently in this batch message (0 to SAMPLES_PER_BATCH) */
-	uint8_t sample_count;
-
-	/** Latest pressure in Pa (updated at 0.1 Hz, sparse).
-	 *  Store once per batch instead of per-sample to save RAM.
-	 */
-	int32_t pressure;
 
 	/** Timestamp of first sample in batch (milliseconds: unix time or uptime) */
 	uint32_t batch_timestamp_ms;
 
-	/** Per-sample time deltas from batch_timestamp_ms in milliseconds (assuming ~10 Hz = ~100 ms apart) */
+	/** Per-sample time deltas from batch_timestamp_ms in milliseconds (assuming ~100 Hz = ~10 ms apart) */
 	uint16_t timestamp_delta_ms[SAMPLES_PER_BATCH];
+
+	/** Latest pressure value in fixed-point Pa (int32_t) */
+	int32_t pressure;	
 
 	/** Contains the current acceleration values in fixed-point (value * 1000 = g).
 	 *  Fixed-point int16_t: range ±32.767g, resolution 0.001g
@@ -76,6 +72,9 @@ struct environmental_msg {
 	 *  Fixed-point int16_t: range ±32.767g, resolution 0.001g
 	 */
 	int16_t accel_lp[3][SAMPLES_PER_BATCH];
+
+	/** Number of samples currently in this batch message (0 to SAMPLES_PER_BATCH) */
+	uint8_t sample_count;
 };
 
 #define MSG_TO_ENVIRONMENTAL_MSG(_msg)	(*(const struct environmental_msg *)_msg)
